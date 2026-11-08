@@ -36,20 +36,39 @@ if [[ -n "$PORT" ]]; then
   [[ "$PORT" =~ ^[0-9]{4}$ && "$PORT" -ge 1024 && "$PORT" != 443 ]] || die "--port: число 1024–9999 (не 443)"
 fi
 
+# На свежем сервере Ubuntu сама ставит обновления (unattended-upgrades) и держит блокировку apt —
+# ждём её до 15 минут и пишем об этом, а не висим молча.
+APT=(apt-get -o DPkg::Lock::Timeout=900 -o Dpkg::Use-Pty=0)
+wait_apt() {
+  if pgrep -x unattended-upgr >/dev/null || pgrep -f "^/usr/bin/python3 /usr/bin/unattended-upgrade" >/dev/null; then
+    echo "    Ubuntu сейчас сама ставит обновления — жду, пока закончит (обычно 2–10 минут)..."
+  fi
+}
+dpkg --configure -a >/dev/null 2>&1 || true  # если прошлую установку прервали посередине
+
 step "Устанавливаю пакеты"
-apt-get update -qq
-apt-get install -y -qq software-properties-common python3 iptables iproute2 curl qrencode dkms >/dev/null
+wait_apt
+"${APT[@]}" update -qq
+"${APT[@]}" install -y -q software-properties-common python3 iptables iproute2 curl qrencode dkms \
+  | grep -E "^(Setting up|Настраивается)" | sed 's/^/    /' || true
 
 if ! command -v awg >/dev/null || ! modinfo amneziawg >/dev/null 2>&1; then
-  step "Устанавливаю AmneziaWG (модуль ядра собирается 1–3 минуты)"
-  add-apt-repository -y ppa:amnezia/ppa >/dev/null
-  apt-get update -qq
-  # Заголовки для текущего ядра и метапакет — чтобы модуль сам пересобирался после обновлений ядра.
+  step "Устанавливаю AmneziaWG"
+  echo "    подключаю репозиторий ppa:amnezia/ppa..."
+  timeout 180 add-apt-repository -y ppa:amnezia/ppa >/dev/null \
+    || die "не удалось подключить репозиторий Amnezia (нет связи с launchpad.net?) — пришлите вывод: add-apt-repository -y ppa:amnezia/ppa"
+  "${APT[@]}" update -qq
+  echo "    ставлю заголовки ядра $(uname -r)..."
+  "${APT[@]}" install -y -qq "linux-headers-$(uname -r)" >/dev/null \
+    || die "нет заголовков для ядра $(uname -r) — пришлите вывод: apt-get install linux-headers-$(uname -r)"
+  echo "    собираю модуль ядра AmneziaWG (1–5 минут, вывод ниже)..."
+  "${APT[@]}" install -y -q amneziawg amneziawg-tools 2>&1 \
+    | grep -E "Building|Installing|DKMS|dkms|Setting up|Error|error" | sed 's/^/    /' || true
+  modinfo amneziawg >/dev/null 2>&1 && command -v awg >/dev/null \
+    || die "не удалось установить AmneziaWG — пришлите вывод: apt-get install amneziawg; dkms status"
+  # Метапакет заголовков — чтобы модуль сам пересобирался после обновлений ядра (не критично).
   FLAVOUR="$(uname -r | sed 's/^[0-9.-]*-//')"
-  apt-get install -y -qq "linux-headers-$(uname -r)" >/dev/null
-  apt-get install -y -qq "linux-headers-$FLAVOUR" >/dev/null 2>&1 || true
-  apt-get install -y -qq amneziawg amneziawg-tools >/dev/null \
-    || die "не удалось установить AmneziaWG — пришлите вывод: apt-get install amneziawg"
+  "${APT[@]}" install -y -qq "linux-headers-$FLAVOUR" >/dev/null 2>&1 || true
 fi
 modprobe amneziawg || die "модуль amneziawg не загрузился — пришлите вывод: dkms status; dmesg | tail -20"
 echo amneziawg >/etc/modules-load.d/amneziawg.conf
@@ -137,7 +156,7 @@ systemctl daemon-reload
 systemctl enable --now vpn-watchdog.timer >/dev/null 2>&1
 
 step "Защита SSH от подбора пароля (fail2ban)"
-if apt-get install -y -qq fail2ban >/dev/null 2>&1; then
+if "${APT[@]}" install -y -qq fail2ban >/dev/null 2>&1; then
   cat >/etc/fail2ban/jail.d/sshd-vpn.local <<'EOF'
 [sshd]
 enabled = true
