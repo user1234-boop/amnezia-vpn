@@ -93,6 +93,10 @@ install -m 755 "$SCRIPT_DIR/lib/vpn.py" /usr/local/bin/vpn
 install -m 755 "$SCRIPT_DIR/lib/vpn-rules.sh" /usr/local/sbin/vpn-rules
 install -m 755 "$SCRIPT_DIR/lib/vpn-watchdog.sh" /usr/local/sbin/vpn-watchdog
 install -m 644 "$SCRIPT_DIR/lib/blocked-nets.txt" /etc/vpn/blocked-nets.txt
+if [[ -f /etc/vpn/bot.env ]]; then  # бот уже настроен (bot.sh) — обновляем и его
+  install -m 755 "$SCRIPT_DIR/lib/vpn-bot.py" /usr/local/bin/vpn-bot
+  systemctl restart vpn-bot 2>/dev/null || true
+fi
 [[ -f /etc/vpn/extra-nets.txt ]] || cat >/etc/vpn/extra-nets.txt <<'EOF'
 # Свои сети «через VPN» для режима «обход» — по одной на строку, например:
 # 203.0.113.0/24
@@ -198,4 +202,5 @@ cat <<EOF
 QR-код для телефона:   vpn qr ИМЯ   (например: vpn qr $(ls /etc/vpn/clients | head -n1 | sed 's/\.json$//'))
 Состояние сервера:     vpn status
 Все команды:           vpn --help
+Telegram-бот (по желанию): bash bot.sh 'ТОКЕН' ВАШ_ID
 EOF

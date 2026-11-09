@@ -283,12 +283,26 @@ def apply(srv, restart=False):
         sh(f"awg syncconf {IFACE} <(awg-quick strip {IFACE})")
 
 
+BOT = "/usr/local/bin/vpn-bot"
+BOT_ENV = f"{ETC}/bot.env"
+
+
+def push_bot(reason):
+    """Если настроен Telegram-бот — он сам пришлёт новые конфиги всех устройств (в фоне)."""
+    if os.environ.get("VPN_NO_PUSH") or not (os.path.exists(BOT) and os.path.exists(BOT_ENV)):
+        return
+    subprocess.Popen([BOT, "send-all", reason], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    print("Новые конфиги придут в Telegram-бот.")
+
+
 # ---------- команды ----------
 
 def cmd_init(a):
     os.makedirs(ETC, mode=0o700, exist_ok=True)
     if os.path.exists(SERVER):
         srv = load(SERVER)
+        ip_changed = bool(a.ip) and a.ip != srv["ip"]
         if a.ip:
             srv["ip"] = a.ip
         if a.wan:
@@ -297,6 +311,8 @@ def cmd_init(a):
         apply(srv, restart=True)
         regen_all(srv)
         print(f"Сервер уже настроен: порты {srv['port']} (+ резерв {', '.join(map(str, srv['backup']))})")
+        if ip_changed:
+            push_bot(f"Сменился IP сервера: теперь {srv['ip']}")
         return
     if not a.ip or not a.wan:
         die("нужны --ip и --wan")
@@ -486,6 +502,7 @@ def cmd_rotate(a):
     print(f"Готово. Порты: {srv['port']} (резерв {', '.join(map(str, srv['backup']))})"
           f"{', маскировка новая' if not a.ports else ''}.")
     print("Старые конфиги больше НЕ работают — импортируйте новые из", OUT)
+    push_bot("Сменились порты" if a.ports else "Сменилась маскировка" if a.obfs else "Сменились порты и маскировка")
 
 
 def cmd_set_ports(a):
@@ -508,12 +525,14 @@ def cmd_set_ports(a):
     apply(srv, restart=True)
     regen_all(srv)
     print(f"Порты: {srv['port']} (резерв {', '.join(map(str, srv['backup']))}). Импортируйте конфиги заново из {OUT}")
+    push_bot(f"Порты заданы вручную: {srv['port']}, {', '.join(map(str, srv['backup']))}")
 
 
 def cmd_regen(a):
     srv = server()
     regen_all(srv)
     print(f"Конфиги пересобраны в {OUT} ({len(split_nets(srv))} сетей в режиме «обход»). Импортируйте заново.")
+    push_bot("Обновился список сетей")
 
 
 def cmd_nets(a):

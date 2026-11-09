@@ -18,7 +18,13 @@ LOCK=/run/vpn-watchdog.lock
 exec 9>"$LOCK"
 flock -n 9 || exit 0
 
-log() { echo "$(date '+%F %T') $*" >>"$LOG"; logger -t vpn-watchdog "$*"; }
+log() {
+  echo "$(date '+%F %T') $*" >>"$LOG"; logger -t vpn-watchdog "$*"
+  # Если настроен Telegram-бот — пишем туда же (в фоне, чтобы сторож не ждал сеть).
+  if [[ -x /usr/local/bin/vpn-bot && -f /etc/vpn/bot.env ]]; then
+    (timeout 30 /usr/local/bin/vpn-bot notify "🛠 Сторож: $*" >/dev/null 2>&1 &)
+  fi
+}
 jget() { python3 -c "import json,sys; print(json.load(open('$SERVER'))['$1'])"; }
 
 [[ -f $SERVER ]] || exit 0
@@ -86,7 +92,7 @@ if (( 10#$(date +%M) % 10 == 0 )); then
   if [[ "${IP_NOW:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$IP_NOW" != "$(jget ip)" ]]; then
     log "внешний IP сменился: $(jget ip) -> $IP_NOW — пересобираю конфиги устройств"
     /usr/local/bin/vpn init --ip "$IP_NOW" >>"$LOG" 2>&1
-    log "ВНИМАНИЕ: новые конфиги в /root/vpn-configs — импортируйте их на устройства"
+    log "ВНИМАНИЕ: новые конфиги в /root/vpn-configs — импортируйте их на устройства (если есть бот — он их пришлёт)"
   fi
   # Есть ли у самого сервера интернет (если нет — проблема у хостинга, а не у VPN).
   if ! ping -c 2 -W 3 -q 1.1.1.1 >/dev/null 2>&1 && ! ping -c 2 -W 3 -q 8.8.8.8 >/dev/null 2>&1; then
