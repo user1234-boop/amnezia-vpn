@@ -27,7 +27,7 @@ fi
 
 TOKEN="${1:-}"
 ADMIN="${2:-}"
-old() { sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | head -n 1; }
+old() { sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | head -n 1 || true; }
 OLD_IDS="$(old ADMIN_IDS)"
 OLD_USER="$(old ADMIN_USERNAME)"
 # Повторный запуск без параметров — обновить код, настройки оставить.
@@ -53,6 +53,9 @@ NAME="$(curl -fsS --max-time 15 "https://api.telegram.org/bot$TOKEN/getMe" \
   || die "Telegram не принял токен (или нет связи с api.telegram.org)"
 
 install -m 755 "$SCRIPT_DIR/lib/vpn-bot.py" /usr/local/bin/vpn-bot
+# Свежие vpn и сторож: они умеют сами присылать новые конфиги в бота.
+install -m 755 "$SCRIPT_DIR/lib/vpn.py" /usr/local/bin/vpn
+install -m 755 "$SCRIPT_DIR/lib/vpn-watchdog.sh" /usr/local/sbin/vpn-watchdog
 umask 077
 printf 'BOT_TOKEN=%s\nADMIN_USERNAME=%s\nADMIN_IDS=%s\n' "$TOKEN" "$USERNAME" "$IDS" >"$ENV_FILE"
 umask 022
