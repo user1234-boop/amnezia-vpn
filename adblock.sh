@@ -25,7 +25,7 @@ DNS_IP=10.8.0.1
 
 if [[ "${1:-}" == "off" ]]; then
   systemctl disable --now vpn-adblock-update.timer dnsmasq 2>/dev/null || true
-  rm -f "$CONF" /etc/systemd/system/vpn-adblock-update.{service,timer} "$FLAG"
+  rm -f "$CONF" /etc/systemd/system/vpn-adblock-update.{service,timer} /etc/systemd/system/dnsmasq.service.d/vpn.conf "$FLAG"
   touch /etc/vpn/adblock-disabled   # чтобы install.sh не включал её снова
   systemctl daemon-reload
   VPN_PUSH_REASON="Выключена блокировка рекламы" vpn regen
@@ -38,9 +38,10 @@ mkdir -p /etc/dnsmasq.d /var/lib/vpn
 [[ -f "$LIST" ]] || : >"$LIST"
 cat >"$CONF" <<EOF
 # DNS для устройств VPN с блокировкой рекламы. Слушает только интерфейс VPN — из интернета закрыт.
-interface=awg0
-except-interface=lo
-bind-dynamic
+# Только адрес VPN: на Ubuntu 24.04 порт 53 на 127.0.0.53 занят systemd-resolved, а сам пакет
+# добавляет --bind-interfaces (с ним нельзя bind-dynamic — dnsmasq не запускается).
+listen-address=$DNS_IP
+bind-interfaces
 no-resolv
 no-hosts
 server=1.1.1.1
@@ -60,6 +61,18 @@ sed -i '/^CONFIG_DIR=/d; /^DNSMASQ_EXCEPT=/d; /^IGNORE_RESOLVCONF=/d' /etc/defau
 printf 'CONFIG_DIR=/etc/dnsmasq.d,.dpkg-dist,.dpkg-old,.dpkg-new\nDNSMASQ_EXCEPT="lo"\nIGNORE_RESOLVCONF=yes\n' \
   >>/etc/default/dnsmasq
 dpkg --configure -a >/dev/null 2>&1 || true
+# Запускать после VPN (адрес 10.8.0.1 появляется вместе с awg0) и подниматься после сбоя самому.
+mkdir -p /etc/systemd/system/dnsmasq.service.d
+cat >/etc/systemd/system/dnsmasq.service.d/vpn.conf <<'UNIT'
+[Unit]
+After=awg-quick@awg0.service
+Wants=awg-quick@awg0.service
+
+[Service]
+Restart=on-failure
+RestartSec=5
+UNIT
+systemctl daemon-reload
 
 cat >"$UPDATE" <<'EOF'
 #!/bin/bash
@@ -118,7 +131,11 @@ echo "    доменов в списке: $(wc -l <"$LIST")"
 systemctl enable dnsmasq vpn-adblock-update.timer >/dev/null 2>&1
 systemctl restart dnsmasq
 systemctl start vpn-adblock-update.timer
-systemctl is-active --quiet dnsmasq || { journalctl -u dnsmasq -n 20 --no-pager; die "dnsmasq не запустился"; }
+sleep 2
+if ! systemctl is-active --quiet dnsmasq || ! ss -lun | grep -q "$DNS_IP:53 "; then
+  journalctl -u dnsmasq -n 20 --no-pager
+  die "dnsmasq не запустился — пришлите этот вывод. Устройства пока работают с обычным DNS."
+fi
 
 if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow in on awg0 to any port 53 comment "VPN DNS" >/dev/null

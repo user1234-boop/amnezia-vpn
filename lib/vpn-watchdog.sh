@@ -101,10 +101,11 @@ if (( 10#$(date +%M) % 10 == 0 )); then
 fi
 
 # 7. Блокировка рекламы: если dnsmasq упал, у устройств с ней не открываются сайты — поднимаем.
-if [[ -f /etc/vpn/adblock-on ]] && ! systemctl is-active --quiet dnsmasq; then
+if [[ -f /etc/vpn/adblock-on ]] && healthy && ! ss -lun | grep -q "10.8.0.1:53 "; then
   log "DNS с блокировкой рекламы (dnsmasq) не работает — перезапускаю"
   systemctl restart dnsmasq 2>>"$LOG"
-  systemctl is-active --quiet dnsmasq && log "dnsmasq снова работает"
+  sleep 2
+  ss -lun | grep -q "10.8.0.1:53 " && log "dnsmasq снова работает"
 fi
 
 # 8. Ресурсы сервера (как мониторинг в MOST): о проблеме, которая держится 2 проверки подряд, —
