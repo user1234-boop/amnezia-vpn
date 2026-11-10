@@ -263,6 +263,10 @@ def ads_enabled():
     return os.path.exists(ADBLOCK_FLAG)
 
 
+def warp_enabled():
+    return os.path.exists("/etc/vpn/warp-on")
+
+
 def send_qr(chat_id, name, v):
     path = f"{OUT}/{name}/{name}-{v}.png"
     if not os.path.exists(path):
@@ -292,6 +296,9 @@ def device_card(chat_id, name):
                  *([[btn("🛡 Реклама: блокируется → выключить" if d.get("ads", True) else
                          "🛡 Реклама: не блокируется → включить",
                          f"ads:{name}:{'off' if d.get('ads', True) else 'on'}")]] if ads_enabled() else []),
+                 *([[btn("☁️ Весь трафик через WARP → выключить" if d.get("warp") else
+                         "☁️ Весь трафик через WARP → включить",
+                         f"warp:{name}:{'off' if d.get('warp') else 'on'}")]] if warp_enabled() else []),
                  [btn("🗑 Удалить", f"delask:{name}"), btn("⬅️ Назад", "list")]])
 
 
@@ -406,6 +413,11 @@ def admin_callback(chat_id, kind, rest):
             return send(chat_id, pre(out))
         send(chat_id, f"✅ <b>{name}</b> добавлен ({mode_name(mode)}). Конфиги:")
         return send_configs(chat_id, name)
+    if kind == "warp":
+        name, _, state = rest.partition(":")
+        ok, out = vpn("warp", name, "on" if state == "on" else "off")
+        send(chat_id, ("✅ " if ok else "") + html.escape(out))
+        return device_card(chat_id, name) if ok else None
     if kind == "ads":
         name, _, state = rest.partition(":")
         ok, out = vpn("ads", name, "on" if state == "on" else "off")

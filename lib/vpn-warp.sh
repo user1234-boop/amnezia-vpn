@@ -39,9 +39,18 @@ rules_down() {
 rules_up() {
   rules_down
   ensure_set
-  # Пакеты из VPN к адресам TikTok — с меткой.
+  # Пакеты из VPN к адресам TikTok — с меткой. Локальные адреса (DNS сервера 10.8.0.1 и т.п.) — никогда.
   iptables -t mangle -N VPN_WARP
+  for n in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+    iptables -t mangle -A VPN_WARP -d "$n" -j RETURN
+  done
   iptables -t mangle -A VPN_WARP -i "$IFACE" -m set --match-set "$SET" dst -j MARK --set-mark "$MARK"
+  # Устройства «весь трафик через WARP» (vpn warp ИМЯ on): все их пакеты — с меткой.
+  if [[ -f /etc/vpn/warp-devices ]]; then
+    while read -r ip; do
+      [[ $ip =~ ^[0-9.]+$ ]] && iptables -t mangle -A VPN_WARP -i "$IFACE" -s "$ip" -j MARK --set-mark "$MARK"
+    done </etc/vpn/warp-devices
+  fi
   iptables -t mangle -A PREROUTING -j VPN_WARP
   # Помеченные — через warp. Нет маршрута (warp упал) — ядро идёт к следующему правилу, обычным путём.
   ip route replace default dev "$WARP" table "$TABLE"

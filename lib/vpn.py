@@ -8,6 +8,7 @@
   vpn mode ИМЯ split|full сменить режим устройства
   vpn del ИМЯ             удалить устройство
   vpn ads ИМЯ on|off      блокировка рекламы у устройства (включается на сервере: bash adblock.sh)
+  vpn warp ИМЯ on|off     весь трафик устройства через Cloudflare WARP (включается: bash warp.sh)
   vpn status              здоровье сервера: VPN, правила, порты, сторож
   vpn rotate [--ports|--obfs]  сменить порты и/или маскировку (конфиги придётся импортировать заново)
   vpn set-ports ОСН [Р1 Р2]    задать порты вручную
@@ -666,9 +667,13 @@ def cmd_mode(a):
 def cmd_del(a):
     srv = server()
     get_client(a.name)
+    was_warp = clients()[a.name].get("warp")
     os.remove(f"{CLIENTS}/{a.name}.json")
     shutil.rmtree(f"{OUT}/{a.name}", ignore_errors=True)
     apply(srv)
+    if was_warp:
+        write_warp_devices()
+        subprocess.run(["/usr/local/sbin/vpn-warp", "rules-up"], check=False)
     print(f"«{a.name}» удалён, его конфиги больше не работают.")
 
 
@@ -713,6 +718,7 @@ def cmd_list(a):
         d = dump.get(c["pub"], {})
         traffic = f"{human(d.get('tx', 0))} / {human(d.get('rx', 0))}" if d else "—"
         ads = ("🛡" if ads_on(c) else "—") if os.path.exists(ADBLOCK_FLAG) else ""
+        ads += "☁" if c.get("warp") else ""
         print(f"{c['name']:<13}{('обход' if c['mode'] == 'split' else 'весь'):<8}{ads:<6}{c['ip']:<12}"
               f"{ago(d.get('hs', 0)):<16}{traffic}")
 
@@ -794,6 +800,31 @@ def resources(wan):
             "disk": round(100 * du.used / du.total), "load": load,
             "down": (n2[0] - n1[0]) * 8 / 1e6, "up": (n2[1] - n1[1]) * 8 / 1e6,
             "total_gb": (n2[0] + n2[1]) / 1e9}
+
+
+WARP_DEVICES = f"{ETC}/warp-devices"
+
+
+def write_warp_devices():
+    """IP устройств, у которых весь трафик идёт через Cloudflare WARP (их читает vpn-warp)."""
+    ips = [c["ip"] for c in clients().values() if c.get("warp")]
+    with open(WARP_DEVICES, "w") as f:
+        f.write("".join(f"{ip}\n" for ip in ips))
+
+
+def cmd_warp(a):
+    c = get_client(a.name)
+    if not os.path.exists(f"{ETC}/warp-on"):
+        die("WARP не включён на сервере: bash warp.sh")
+    c["warp"] = a.state == "on"
+    save(f"{CLIENTS}/{c['name']}.json", c)
+    write_warp_devices()
+    subprocess.run(["/usr/local/sbin/vpn-warp", "rules-up"], check=False)
+    if c["warp"]:
+        print(f"«{c['name']}»: весь трафик через Cloudflare WARP (IP Cloudflare, не сервера). "
+              "Конфиг менять не нужно — переподключите VPN.")
+    else:
+        print(f"«{c['name']}»: через WARP только TikTok, остальное — с IP сервера.")
 
 
 def cmd_ads(a):
@@ -907,6 +938,8 @@ def main():
     s = sub.add_parser("del"); s.add_argument("name"); s.set_defaults(fn=cmd_del)
     s = sub.add_parser("ads"); s.add_argument("name"); s.add_argument("state", choices=["on", "off"])
     s.set_defaults(fn=cmd_ads)
+    s = sub.add_parser("warp"); s.add_argument("name"); s.add_argument("state", choices=["on", "off"])
+    s.set_defaults(fn=cmd_warp)
     sub.add_parser("list").set_defaults(fn=cmd_list)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     s = sub.add_parser("rotate"); g = s.add_mutually_exclusive_group()
