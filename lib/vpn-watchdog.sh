@@ -20,7 +20,12 @@ flock -n 9 || exit 0
 
 log() {
   echo "$(date '+%F %T') $*" >>"$LOG"; logger -t vpn-watchdog "$*"
-  # Если настроен Telegram-бот — пишем туда же (в фоне, чтобы сторож не ждал сеть).
+  # В бота — то же сообщение не чаще раза в час (иначе повторяющийся сбой спамит каждую минуту).
+  local key last
+  key="/run/vpn-watchdog.sent.$(printf '%s' "$*" | md5sum | cut -c1-12)"
+  last=$(stat -c %Y "$key" 2>/dev/null || echo 0)
+  (( $(date +%s) - last < 3600 )) && return 0
+  touch "$key"
   if [[ -x /usr/local/bin/vpn-bot && -f /etc/vpn/bot.env ]]; then
     (timeout 30 /usr/local/bin/vpn-bot notify "🛠 Сторож: $*" >/dev/null 2>&1 &)
   fi
@@ -112,8 +117,17 @@ fi
 #    WARP не отвечает — убираем маршрут, чтобы TikTok шёл хотя бы с IP сервера, а не пропадал.
 if [[ -f /etc/vpn/warp-on ]]; then
   if ! ip link show warp >/dev/null 2>&1; then
-    log "туннель WARP упал — поднимаю"
     systemctl restart wg-quick@warp 2>>"$LOG"
+    if ip link show warp >/dev/null 2>&1; then
+      log "туннель WARP падал — поднял"; rm -f /run/vpn-watchdog.warp-fails
+    else
+      n=$(( $(cat /run/vpn-watchdog.warp-fails 2>/dev/null || echo 0) + 1 )); echo "$n" >/run/vpn-watchdog.warp-fails
+      log "туннель WARP не поднимается (TikTok идёт с IP сервера) — проверьте: bash warp.sh status"
+      if (( n >= 60 )); then  # час без успеха — перестаём пытаться
+        rm -f /etc/vpn/warp-on /run/vpn-watchdog.warp-fails
+        log "WARP так и не поднялся за час — сторож больше его не трогает. Включить снова: bash warp.sh"
+      fi
+    fi
   fi
   if ip link show warp >/dev/null 2>&1; then
     if /usr/local/sbin/vpn-warp test 2>/dev/null | grep -q 'warp=on'; then

@@ -66,10 +66,15 @@ if [[ ! -f wgcf-profile.conf ]]; then
 fi
 
 echo "==> Настраиваю туннель warp"
-PRIV="$(awk -F' *= *' '$1=="PrivateKey"{print $2; exit}' wgcf-profile.conf)"
-PUB="$(awk -F' *= *' '$1=="PublicKey"{print $2; exit}' wgcf-profile.conf)"
-ADDR="$(awk -F' *= *' '$1=="Address"{print $2}' wgcf-profile.conf | tr ',' '\n' | grep -m1 -E '^[0-9.]+/' | xargs)"
-EP="$(awk -F' *= *' '$1=="Endpoint"{print $2; exit}' wgcf-profile.conf)"
+# Значение — всё после первого «=»: ключи base64 сами заканчиваются на «=», их нельзя резать по нему.
+val() { sed -nE "/^$1[[:space:]]*=/{s/^[^=]*=[[:space:]]*//;s/[[:space:]]*\r?$//;p;q}" wgcf-profile.conf; }
+PRIV="$(val PrivateKey)"
+PUB="$(val PublicKey)"
+EP="$(val Endpoint)"
+# Address бывает одной строкой «v4, v6» или двумя строками — берём IPv4.
+ADDR="$(sed -nE 's/^Address[[:space:]]*=[[:space:]]*//p' wgcf-profile.conf | tr ',' '\n' \
+  | awk '{gsub(/[[:space:]\r]/, "")} !f && /^[0-9.]+\/[0-9]+$/ {print; f=1}')"
+[[ ${#PRIV} -eq 44 && ${#PUB} -eq 44 ]] || die "ключи в профиле WARP неправильной длины: $DIR/wgcf-profile.conf"
 [[ -n "$PRIV" && -n "$PUB" && -n "$ADDR" && -n "$EP" ]] || die "в профиле WARP не хватает данных: $DIR/wgcf-profile.conf"
 umask 077
 cat >"$CONF" <<EOF
@@ -95,10 +100,14 @@ if systemctl is-active --quiet dnsmasq; then
   printf 'ipset=/%s/vpn_warp\n' "$(echo $DOMAINS | tr ' ' '/')" >/etc/dnsmasq.d/vpn-warp.conf
 fi
 
-touch "$FLAG"
 ipset create vpn_warp hash:net timeout 172800 -exist
 systemctl enable wg-quick@warp >/dev/null 2>&1
-systemctl restart wg-quick@warp || { journalctl -u wg-quick@warp -n 20 --no-pager; die "туннель warp не поднялся"; }
+if ! systemctl restart wg-quick@warp; then
+  journalctl -u wg-quick@warp -n 20 --no-pager
+  rm -f "$FLAG"; systemctl disable wg-quick@warp >/dev/null 2>&1 || true   # сторож не будет его поднимать
+  die "туннель warp не поднялся — пришлите этот вывод. TikTok идёт как раньше."
+fi
+touch "$FLAG"   # только когда туннель поднялся: по этой отметке за ним следит сторож
 [[ -f /etc/dnsmasq.d/vpn-warp.conf ]] && systemctl restart dnsmasq
 
 sleep 3
@@ -107,6 +116,7 @@ T="$(/usr/local/sbin/vpn-warp test || true)"
 echo "$T" | sed 's/^/    /'
 if ! grep -q 'warp=on' <<<"$T"; then
   echo "ВНИМАНИЕ: WARP не отвечает. TikTok пока идёт как раньше, с IP сервера. Пришлите вывод: bash warp.sh status"
+  echo "Выключить, чтобы сторож не пытался: bash warp.sh off"
   exit 1
 fi
 cat <<EOF
