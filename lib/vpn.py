@@ -12,17 +12,21 @@
   vpn set-ports ОСН [Р1 Р2]    задать порты вручную
   vpn regen               пересобрать файлы конфигов (после правки списка сетей)
   vpn nets                сколько сетей в режиме «обход»
+  vpn tiktok [--check]    обновить сети TikTok (каждый час это делает vpn-tiktok.timer)
 """
 import argparse
+import bisect
 import ipaddress
 import json
 import os
 import random
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import urllib.request
 
 ETC = "/etc/vpn"
 SERVER = f"{ETC}/server.json"
@@ -37,6 +41,35 @@ SUBNET = ipaddress.ip_network("10.8.0.0/24")
 MTU = 1280
 DNS = "1.1.1.1, 1.0.0.1"
 MAX_NETS = 100
+TIKTOK_FILE = f"{ETC}/tiktok-nets.txt"   # собирается сам: vpn tiktok (и каждый час vpn-tiktok.timer)
+RU_FILE = f"{ETC}/ru-nets.txt"           # российские сети: их нельзя задеть при объединении сетей
+
+# TikTok целиком через VPN в режиме «обход»: сети TikTok/ByteDance (как у MOST) + адреса,
+# на которые домены TikTok указывают прямо сейчас (из Нидерландов). Адреса CDN TikTok меняются,
+# поэтому раз в час сервер проверяет, все ли они покрыты, и обновляет список, только если нет.
+TIKTOK_ASNS = (138699, 396986)  # TikTok Pte. Ltd., ByteDance Inc.
+TIKTOK_ASN_MAX = 40             # самых крупных IPv4-сетей из этих AS
+TIKTOK_HOSTS = (
+    "tiktok.com", "www.tiktok.com", "m.tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "webcast.tiktok.com",
+    "tiktokv.com", "api.tiktokv.com", "api16-normal-c-useast1a.tiktokv.com", "api16-normal-c-useast2a.tiktokv.com",
+    "api16-normal-c-alisg.tiktokv.com", "api19-normal-c-useast1a.tiktokv.com", "api22-normal-c-useast2a.tiktokv.com",
+    "api22-normal-c-alisg.tiktokv.com", "api16-normal-useast5.tiktokv.us", "api16-normal-no1a.tiktokv.eu",
+    "log.tiktokv.com", "log22-normal-c-useast2a.tiktokv.com", "mon.tiktokv.com", "mon-va.tiktokv.com",
+    "mcs.tiktokv.com", "im-api-va.tiktok.com", "webcast16-normal-c-useast1a.tiktokv.com",
+    "v16m.tiktokcdn.com", "v19.tiktokcdn.com", "v16-webapp.tiktok.com", "v16-webapp-prime.tiktok.com",
+    "v19-webapp-prime.tiktok.com", "v16m-default.akamaized.net", "v16m-webapp.tiktokcdn-us.com",
+    "p16-sign-va.tiktokcdn.com", "p16-sign-sg.tiktokcdn.com", "p16-sign.tiktokcdn-us.com",
+    "p77-sign-va.tiktokcdn.com", "lf16-tiktok-web.tiktokcdn-us.com", "sf16-website-login.neutral.ttwstatic.com",
+    "lf16-tiktok-common.ibytedtos.com", "sf-tb-sg.ibytedtos.com", "lf16-effectcdn.byteeffecttos-g.com",
+)
+TIKTOK_DNS_KEEP = 14 * 86400    # адрес по DNS держим в списке 14 дней после последнего появления
+RU_SOURCES = (
+    "https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone",
+    "https://stat.ripe.net/data/country-resource-list/data.json?resource=RU&v4_format=prefix",
+)
+# Локальные и служебные сети: никогда не заворачиваем в VPN (домашний роутер, принтеры).
+LOCAL_NETS = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+              "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/3")
 FULL = "0.0.0.0/0, ::/0"
 
 # Порты: не 443, не больше 4 цифр. Плюс не берём известные порты VPN/прокси/VoIP —
@@ -174,15 +207,101 @@ def read_nets(path):
     return nets
 
 
-def split_nets(srv):
-    nets = read_nets(NETS_BASE) + read_nets(NETS_EXTRA)
+def split_nets(srv, limit=MAX_NETS):
+    """Сети режима «обход». Приоритет: свой список (всегда) -> адреса TikTok по DNS (свежие первыми) ->
+    сети ByteDance (крупные первыми); TikTok — сколько влезет в лимит без российских адресов."""
+    tiktok = read_tiktok()
+    must = read_nets(NETS_BASE) + read_nets(NETS_EXTRA)
+    optional = ([n for n, kind, ts in sorted(tiktok, key=lambda t: -t[2]) if kind == "dns"]  # свежие первыми
+                + sorted((n for n, kind, _ in tiktok if kind == "asn"), key=lambda n: n.prefixlen))
+    full = build_nets(srv, must + optional, limit)
+    if full is not None:
+        return full
+    lo, hi, best = 0, len(optional) - 1, None  # сколько сетей TikTok влезает — двоичным поиском
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        got = build_nets(srv, must + optional[:mid], limit)
+        if got is not None:
+            best, lo = got, mid + 1
+        else:
+            hi = mid - 1
+    if best is None:
+        die(f"не получается уложить сети в {limit} без российских адресов — "
+            f"сократите {NETS_EXTRA} или уберите что-то из {NETS_BASE}")
+    return best
+
+
+_BAD = {}
+
+
+def build_nets(srv, nets, limit):
     v4 = list(ipaddress.collapse_addresses(n for n in nets if n.version == 4))
     v6 = list(ipaddress.collapse_addresses(n for n in nets if n.version == 6))
     # Адрес самого сервера в туннель заворачивать нельзя — туннель замкнётся на себя.
     me = ipaddress.ip_network(f"{srv['ip']}/32")
     v4 = list(ipaddress.collapse_addresses(
         sub for n in v4 for sub in (n.address_exclude(me) if n.supernet_of(me) else [n])))
+    if len(v4) + len(v6) > limit:
+        if "bad" not in _BAD:
+            _BAD["bad"] = forbidden(srv)
+        v4 = compress(v4, limit - len(v6), _BAD["bad"])
+        if v4 is None:
+            return None
     return v4 + v6
+
+
+def forbidden(srv):
+    """Что нельзя накрыть при объединении сетей: российские сети, локальные, сам сервер."""
+    ru = read_nets(RU_FILE)
+    if not ru:
+        try:
+            ru = fetch_ru()
+        except Exception as e:
+            die(f"сетей больше {MAX_NETS}, а для их объединения нужен список российских сетей, "
+                f"и он не скачался ({e}). Проверьте интернет на сервере и повторите")
+    extra = [ipaddress.ip_network(n) for n in LOCAL_NETS] + [ipaddress.ip_network(f"{srv['ip']}/32")]
+    iv = sorted((int(n.network_address), int(n.broadcast_address)) for n in ru + extra if n.version == 4)
+    merged = []
+    for lo, hi in iv:
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return merged
+
+
+def compress(v4, limit, bad):
+    """None, если уложиться нельзя. Объединяет соседние сети в общие надсети, пока их не станет limit.
+
+    Каждый раз берётся пара, объединение которой захватывает меньше всего лишних адресов, и только
+    если надсеть не задевает ни одной российской/локальной сети — так через VPN пойдут лишь лишние
+    зарубежные адреса (не страшно), а банки и Госуслуги по-прежнему напрямую.
+    """
+    starts = [lo for lo, _ in bad]
+
+    def clean(net):
+        lo, hi = int(net.network_address), int(net.broadcast_address)
+        i = bisect.bisect_right(starts, hi) - 1
+        return i < 0 or bad[i][1] < lo
+
+    v4 = sorted(v4)
+    while len(v4) > limit:
+        best = None
+        for i in range(len(v4) - 1):
+            x, y = v4[i], v4[i + 1]
+            lo, hi = int(x.network_address), int(y.broadcast_address)
+            plen = min(x.prefixlen, y.prefixlen, 32 - (lo ^ hi).bit_length())
+            if plen < 8:
+                continue
+            sup = ipaddress.ip_network((lo, plen), strict=False)
+            waste = sup.num_addresses - x.num_addresses - y.num_addresses
+            if (best is None or waste < best[0]) and clean(sup):
+                best = (waste, sup)
+        if best is None:
+            return None
+        sup = best[1]
+        v4 = sorted(ipaddress.collapse_addresses([n for n in v4 if not n.subnet_of(sup)] + [sup]))
+    return v4
 
 
 def split_allowed(srv):
@@ -281,6 +400,150 @@ def apply(srv, restart=False):
         sh(["systemctl", "restart", f"awg-quick@{IFACE}"])
     else:
         sh(f"awg syncconf {IFACE} <(awg-quick strip {IFACE})")
+
+
+def http_get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "vpn-nets/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read().decode()
+
+
+def fetch_ru():
+    """Российские сети (ipdeny, запасной — RIPEstat) -> RU_FILE."""
+    err = None
+    for url in RU_SOURCES:
+        try:
+            body = http_get(url).strip()
+            if body.startswith("{"):
+                lines = json.loads(body)["data"]["resources"]["ipv4"]
+            else:
+                lines = body.splitlines()
+            nets = []
+            for p in lines:
+                p = p.strip()
+                if not p or p.startswith("#"):
+                    continue
+                if "-" in p:
+                    a, b = (ipaddress.IPv4Address(x.strip()) for x in p.split("-"))
+                    nets += ipaddress.summarize_address_range(a, b)
+                else:
+                    nets.append(ipaddress.ip_network(p, strict=False))
+            nets = list(ipaddress.collapse_addresses(n for n in nets if n.version == 4))
+            if len(nets) < 1000:
+                raise ValueError(f"подозрительно мало сетей: {len(nets)}")
+            with open(RU_FILE + ".tmp", "w") as f:
+                f.write(f"# российские сети ({url}), {time.strftime('%F')}\n" + "\n".join(map(str, nets)) + "\n")
+            os.replace(RU_FILE + ".tmp", RU_FILE)
+            return nets
+        except Exception as e:
+            err = e
+    raise RuntimeError(err)
+
+
+def fetch_asn(asn):
+    data = json.loads(http_get(f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn}"))
+    return [ipaddress.ip_network(p["prefix"], strict=False) for p in data["data"]["prefixes"]]
+
+
+def resolve_tiktok():
+    ips = set()
+    for host in TIKTOK_HOSTS:
+        try:
+            for info in socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM):
+                ips.add(ipaddress.ip_address(info[4][0]))
+        except OSError:
+            pass
+    return ips
+
+
+def read_tiktok():
+    """Строки TIKTOK_FILE: «сеть # asn» или «сеть # dns ВРЕМЯ»."""
+    out = []
+    try:
+        with open(TIKTOK_FILE) as f:
+            for line in f:
+                net, _, note = line.partition("#")
+                net, note = net.strip(), note.split()
+                if net and note:
+                    out.append((ipaddress.ip_network(net), note[0], int(note[1]) if len(note) > 1 else 0))
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def cmd_tiktok(a):
+    srv = server()
+    ips = resolve_tiktok()
+    if not ips:
+        die("не удалось получить адреса TikTok по DNS — есть ли интернет на сервере?")
+    try:
+        before = split_allowed(srv)
+    except SystemExit:
+        before = None
+    # Российские сети: обновляем раз в неделю (нужны, чтобы не завернуть их в VPN).
+    if not os.path.exists(RU_FILE) or time.time() - os.path.getmtime(RU_FILE) > 7 * 86400:
+        try:
+            fetch_ru()
+        except Exception as e:
+            if not os.path.exists(RU_FILE):
+                die(f"не скачался список российских сетей: {e}")
+    ru = read_nets(RU_FILE)
+    ru_starts = sorted((int(n.network_address), int(n.broadcast_address)) for n in ru)
+    starts = [lo for lo, _ in ru_starts]
+
+    def is_ru(ip):
+        i = bisect.bisect_right(starts, int(ip)) - 1
+        return i >= 0 and ru_starts[i][1] >= int(ip)
+
+    if a.check and os.path.exists(TIKTOK_FILE) and before:
+        covered = [ipaddress.ip_network(n.strip()) for n in before.split(",")]
+        missing = [ip for ip in ips if not is_ru(ip) and not any(ip in n for n in covered if n.version == 4)]
+        if not missing:
+            print(f"{time.strftime('%F %T')} TikTok: все {len(ips)} адресов уже идут через VPN")
+            return
+        print(f"{time.strftime('%F %T')} TikTok переехал: {len(missing)} новых адресов из {len(ips)} — обновляю")
+
+    now = int(time.time())
+    old = read_tiktok()
+    dns = {n: ts for n, kind, ts in old if kind == "dns" and now - ts < TIKTOK_DNS_KEEP}
+    for ip in ips:
+        if not is_ru(ip):  # российские кэши TikTok не трогаем
+            dns[ipaddress.ip_network(f"{ip}/24", strict=False)] = now
+    asn_nets = []
+    old_asn = [n for n, kind, _ in old if kind == "asn"]
+    fresh = os.path.exists(TIKTOK_FILE) and time.time() - os.path.getmtime(TIKTOK_FILE) < 86400
+    for asn in (() if fresh and old_asn else TIKTOK_ASNS):  # сети ByteDance меняются редко — раз в сутки
+        try:
+            asn_nets += fetch_asn(asn)
+        except Exception as e:
+            print(f"сети AS{asn} не скачались: {e}", file=sys.stderr)
+    if asn_nets:
+        v4 = sorted((n for n in ipaddress.collapse_addresses(n for n in asn_nets if n.version == 4)),
+                    key=lambda n: n.prefixlen)[:TIKTOK_ASN_MAX]
+        v6 = sorted((n for n in ipaddress.collapse_addresses(n for n in asn_nets if n.version == 6)),
+                    key=lambda n: n.prefixlen)[:2]
+        asn_nets = v4 + v6
+    else:  # свежие уже есть или RIPEstat недоступен — оставляем прежние
+        asn_nets = old_asn
+
+    lines = [f"# Собрано автоматически: vpn tiktok, {time.strftime('%F %T')}. Руками не править.",
+             *(f"{n} # asn" for n in asn_nets),
+             *(f"{n} # dns {ts}" for n, ts in sorted(dns.items()))]
+    with open(TIKTOK_FILE + ".tmp", "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(TIKTOK_FILE + ".tmp", TIKTOK_FILE)
+
+    after = split_allowed(srv)
+    if after == before:
+        print(f"TikTok: {len(ips)} адресов, список сетей не изменился — конфиги прежние.")
+        return
+    regen_all(srv)
+    final = [n for n in split_nets(srv) if n.version == 4]
+    cov = sum(1 for ip in ips if any(ip in n for n in final))
+    print(f"TikTok в режиме «обход»: через VPN {cov} из {len(ips)} его адресов"
+          f"{' — все' if cov == len(ips) else ' (остальные — российские кэши или не влезли в лимит)'}.")
+    print(f"Всего в режиме «обход» {len(split_nets(srv))} сетей. Конфиги «обхода» пересобраны — импортируйте заново.")
+    push_bot("Обновился список сетей (TikTok)")
 
 
 BOT = "/usr/local/bin/vpn-bot"
@@ -538,7 +801,12 @@ def cmd_regen(a):
 def cmd_nets(a):
     srv = server()
     nets = split_nets(srv)
+    tk = read_tiktok()
     print(f"В режиме «обход» через VPN идут {len(nets)} сетей (лимит {MAX_NETS}).")
+    if tk:
+        print(f"TikTok: {sum(1 for t in tk if t[1] == 'asn')} сетей ByteDance + {sum(1 for t in tk if t[1] == 'dns')} "
+              f"по DNS ({TIKTOK_FILE}); соседние сети объединены без российских адресов.")
+        print("Обновляется само каждый час (vpn-tiktok.timer), журнал: /var/log/vpn-tiktok.log")
     print(f"Основной список: {NETS_BASE} (обновляется при git pull + install.sh)")
     print(f"Свои сети: {NETS_EXTRA} (по одной на строку), потом: vpn regen")
     if a.verbose:
@@ -574,6 +842,8 @@ def main():
     s = sub.add_parser("set-ports"); s.add_argument("main", type=int); s.add_argument("backup", type=int, nargs="*")
     s.set_defaults(fn=cmd_set_ports)
     sub.add_parser("regen").set_defaults(fn=cmd_regen)
+    s = sub.add_parser("tiktok"); s.add_argument("--check", action="store_true", help="обновить, только если TikTok переехал")
+    s.set_defaults(fn=cmd_tiktok)
     s = sub.add_parser("nets"); s.add_argument("-v", "--verbose", action="store_true"); s.set_defaults(fn=cmd_nets)
     s = sub.add_parser("apply"); s.add_argument("--restart", action="store_true"); s.set_defaults(fn=cmd_apply)
     a = p.parse_args()

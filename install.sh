@@ -159,6 +159,38 @@ EOF
 systemctl daemon-reload
 systemctl enable --now vpn-watchdog.timer >/dev/null 2>&1
 
+step "TikTok целиком через VPN в режиме «обход» (проверка раз в час)"
+cat >/etc/systemd/system/vpn-tiktok.service <<'UNIT'
+[Unit]
+Description=VPN: обновить сети TikTok, если он переехал
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpn tiktok --check
+StandardOutput=append:/var/log/vpn-tiktok.log
+StandardError=append:/var/log/vpn-tiktok.log
+UNIT
+cat >/etc/systemd/system/vpn-tiktok.timer <<'UNIT'
+[Unit]
+Description=VPN: сети TikTok раз в час
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now vpn-tiktok.timer >/dev/null 2>&1
+if [[ ! -f /etc/vpn/tiktok-nets.txt ]]; then
+  echo "    собираю сети TikTok (до минуты)..."
+  vpn tiktok 2>&1 | sed 's/^/    /' || echo "    не получилось — повторится само в течение часа"
+fi
+
 step "Защита SSH от подбора пароля (fail2ban)"
 if "${APT[@]}" install -y -qq fail2ban >/dev/null 2>&1; then
   cat >/etc/fail2ban/jail.d/sshd-vpn.local <<'EOF'
