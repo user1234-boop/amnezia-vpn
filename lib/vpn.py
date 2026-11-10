@@ -461,6 +461,11 @@ def read_tiktok():
 
 
 def cmd_tiktok(a):
+    if a.print:  # для vpn-warp: сети TikTok (IPv4) по одной на строку
+        for n, _, _ in read_tiktok():
+            if n.version == 4:
+                print(n)
+        return
     srv = server()
     ips = resolve_tiktok()
     if not ips:
@@ -739,6 +744,9 @@ def cmd_status(a):
     if os.path.exists(ADBLOCK_FLAG):
         dns_ok = subprocess.run(["systemctl", "is-active", "--quiet", "dnsmasq"]).returncode == 0
         print(f"{ok(dns_ok)} блокировка рекламы (dnsmasq на {ADBLOCK_DNS})")
+    if os.path.exists(f"{ETC}/warp-on"):
+        w = subprocess.run("/usr/local/sbin/vpn-warp check", shell=True, capture_output=True).returncode == 0
+        print(f"{ok(w)} TikTok через Cloudflare WARP" + ("" if w else " (сейчас идёт с IP сервера; bash warp.sh status)"))
     print(f"Сервер: {srv['ip']}, MTU {MTU}, устройств: {len(clients())}, подключено сейчас: {online}")
     r = resources(srv["wan"])
     print(f"Процессор {r['cpu']}% · память {r['mem']}% · диск {r['disk']}% · нагрузка {r['load']}")
@@ -908,6 +916,7 @@ def main():
     s.set_defaults(fn=cmd_set_ports)
     sub.add_parser("regen").set_defaults(fn=cmd_regen)
     s = sub.add_parser("tiktok"); s.add_argument("--check", action="store_true", help="обновить, только если TikTok переехал")
+    s.add_argument("--print", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_tiktok)
     s = sub.add_parser("nets"); s.add_argument("-v", "--verbose", action="store_true")
     s.add_argument("check", nargs="*", help="сайты: как они пойдут (напр. vpn nets youtube.com sberbank.ru)")

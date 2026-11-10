@@ -108,7 +108,28 @@ if [[ -f /etc/vpn/adblock-on ]] && healthy && ! ss -lun | grep -q "10.8.0.1:53 "
   ss -lun | grep -q "10.8.0.1:53 " && log "dnsmasq снова работает"
 fi
 
-# 8. Ресурсы сервера (как мониторинг в MOST): о проблеме, которая держится 2 проверки подряд, —
+# 8. TikTok через Cloudflare WARP (warp.sh): туннель поднят, WARP отвечает, список адресов свежий.
+#    WARP не отвечает — убираем маршрут, чтобы TikTok шёл хотя бы с IP сервера, а не пропадал.
+if [[ -f /etc/vpn/warp-on ]]; then
+  if ! ip link show warp >/dev/null 2>&1; then
+    log "туннель WARP упал — поднимаю"
+    systemctl restart wg-quick@warp 2>>"$LOG"
+  fi
+  if ip link show warp >/dev/null 2>&1; then
+    if /usr/local/sbin/vpn-warp test 2>/dev/null | grep -q 'warp=on'; then
+      if ! /usr/local/sbin/vpn-warp check; then
+        /usr/local/sbin/vpn-warp rules-up 2>>"$LOG" && log "WARP работает — TikTok снова идёт через WARP"
+      elif (( 10#$(date +%M) % 10 == 5 )); then
+        /usr/local/sbin/vpn-warp refresh 2>>"$LOG"
+      fi
+    elif ip route show table 7777 2>/dev/null | grep -q .; then
+      ip route flush table 7777
+      log "WARP не отвечает — TikTok временно идёт с IP сервера"
+    fi
+  fi
+fi
+
+# 9. Ресурсы сервера (как мониторинг в MOST): о проблеме, которая держится 2 проверки подряд, —
 #    🔴 в бота; когда прошла — 🟢.
 alert() {  # имя, 1/0 (плохо?), текст проблемы, текст «прошло»
   local f="/run/vpn-watchdog.alert.$1" n

@@ -97,6 +97,7 @@ install -m 755 "$SCRIPT_DIR/lib/vpn.py" /usr/local/bin/vpn
 install -m 755 "$SCRIPT_DIR/lib/vpn-rules.sh" /usr/local/sbin/vpn-rules
 install -m 755 "$SCRIPT_DIR/lib/vpn-watchdog.sh" /usr/local/sbin/vpn-watchdog
 install -m 644 "$SCRIPT_DIR/lib/blocked-nets.txt" /etc/vpn/blocked-nets.txt
+[[ -f /etc/vpn/warp-on ]] && install -m 755 "$SCRIPT_DIR/lib/vpn-warp.sh" /usr/local/sbin/vpn-warp
 if [[ -f /etc/vpn/bot.env ]]; then  # бот уже настроен (bot.sh) — обновляем и его
   install -m 755 "$SCRIPT_DIR/lib/vpn-bot.py" /usr/local/bin/vpn-bot
   systemctl restart vpn-bot 2>/dev/null || true
