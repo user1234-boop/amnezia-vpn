@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """vpn — управление личным VPN на AmneziaWG.
 
-  vpn add ИМЯ [--full]    новое устройство (по умолчанию режим «обход»: через VPN только заблокированное)
+  vpn add ИМЯ [--full]    новое устройство (по умолчанию «обход»: через VPN всё, кроме российских сайтов)
   vpn list                устройства: подключены ли, когда последний раз, трафик
   vpn qr ИМЯ [1|2|3]      QR-код конфига прямо в терминале
   vpn show ИМЯ [1|2|3]    текст конфига
   vpn mode ИМЯ split|full сменить режим устройства
   vpn del ИМЯ             удалить устройство
+  vpn ads ИМЯ on|off      блокировка рекламы у устройства (включается на сервере: bash adblock.sh)
   vpn status              здоровье сервера: VPN, правила, порты, сторож
   vpn rotate [--ports|--obfs]  сменить порты и/или маскировку (конфиги придётся импортировать заново)
   vpn set-ports ОСН [Р1 Р2]    задать порты вручную
   vpn regen               пересобрать файлы конфигов (после правки списка сетей)
-  vpn nets                сколько сетей в режиме «обход»
+  vpn nets [САЙТ ...]     режим «обход»: сколько сетей и как пойдут сайты (vpn nets youtube.com sberbank.ru)
   vpn tiktok [--check]    обновить сети TikTok (каждый час это делает vpn-tiktok.timer)
 """
 import argparse
@@ -40,11 +41,12 @@ AWG_CONF = f"/etc/amnezia/amneziawg/{IFACE}.conf"
 SUBNET = ipaddress.ip_network("10.8.0.0/24")
 MTU = 1280
 DNS = "1.1.1.1, 1.0.0.1"
-MAX_NETS = 100
+SPLIT_LIMIT = 1000   # сетей в режиме «обход»; своё значение: SPLIT_LIMIT=... в /etc/vpn/options
+OPTIONS = f"{ETC}/options"
 TIKTOK_FILE = f"{ETC}/tiktok-nets.txt"   # собирается сам: vpn tiktok (и каждый час vpn-tiktok.timer)
-RU_FILE = f"{ETC}/ru-nets.txt"           # российские сети: их нельзя задеть при объединении сетей
+RU_FILE = f"{ETC}/ru-nets.txt"           # российские сети: в режиме «обход» идут напрямую
 
-# TikTok целиком через VPN в режиме «обход»: сети TikTok/ByteDance (как у MOST) + адреса,
+# TikTok всегда через VPN в режиме «обход»: сети TikTok/ByteDance (как у MOST) + адреса,
 # на которые домены TikTok указывают прямо сейчас (из Нидерландов). Адреса CDN TikTok меняются,
 # поэтому раз в час сервер проверяет, все ли они покрыты, и обновляет список, только если нет.
 TIKTOK_ASNS = (138699, 396986)  # TikTok Pte. Ltd., ByteDance Inc.
@@ -71,6 +73,9 @@ RU_SOURCES = (
 LOCAL_NETS = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
               "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/3")
 FULL = "0.0.0.0/0, ::/0"
+QR_MAX = 2900  # больше QR-код не вмещает
+ADBLOCK_FLAG = f"{ETC}/adblock-on"   # ставит adblock.sh
+ADBLOCK_DNS = str(SUBNET[1])          # dnsmasq с блокировкой рекламы на адресе сервера в VPN
 
 # Порты: не 443, не больше 4 цифр. Плюс не берём известные порты VPN/прокси/VoIP —
 # их ТСПУ и хостинги проверяют в первую очередь.
@@ -207,109 +212,83 @@ def read_nets(path):
     return nets
 
 
-def split_nets(srv, limit=MAX_NETS):
-    """Сети режима «обход». Приоритет: свой список (всегда) -> адреса TikTok по DNS (свежие первыми) ->
-    сети ByteDance (крупные первыми); TikTok — сколько влезет в лимит без российских адресов."""
-    tiktok = read_tiktok()
-    must = read_nets(NETS_BASE) + read_nets(NETS_EXTRA)
-    optional = ([n for n, kind, ts in sorted(tiktok, key=lambda t: -t[2]) if kind == "dns"]  # свежие первыми
-                + sorted((n for n, kind, _ in tiktok if kind == "asn"), key=lambda n: n.prefixlen))
-    full = build_nets(srv, must + optional, limit)
-    if full is not None:
-        return full
-    lo, hi, best = 0, len(optional) - 1, None  # сколько сетей TikTok влезает — двоичным поиском
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        got = build_nets(srv, must + optional[:mid], limit)
-        if got is not None:
-            best, lo = got, mid + 1
-        else:
-            hi = mid - 1
-    if best is None:
-        die(f"не получается уложить сети в {limit} без российских адресов — "
-            f"сократите {NETS_EXTRA} или уберите что-то из {NETS_BASE}")
-    return best
+def option(name, default):
+    """Свои настройки из /etc/vpn/options (строки ИМЯ=значение)."""
+    try:
+        with open(OPTIONS) as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k == name and v:
+                    return v
+    except FileNotFoundError:
+        pass
+    return default
 
 
-_BAD = {}
+def ru_nets():
+    nets = read_nets(RU_FILE)
+    if not nets:
+        try:
+            nets = fetch_ru()
+        except Exception as e:
+            print(f"Внимание: не скачался список российских сетей ({e}) — режим «обход» временно "
+                  "только по списку заблокированных сервисов", file=sys.stderr)
+    return [n for n in nets if n.version == 4]
 
 
-def build_nets(srv, nets, limit):
-    v4 = list(ipaddress.collapse_addresses(n for n in nets if n.version == 4))
-    v6 = list(ipaddress.collapse_addresses(n for n in nets if n.version == 6))
-    # Адрес самого сервера в туннель заворачивать нельзя — туннель замкнётся на себя.
+def gaps(direct):
+    """Промежутки IPv4-пространства между сетями direct: (начало, конец)."""
+    out, cur = [], 0
+    for net in ipaddress.collapse_addresses(direct):
+        start, end = int(net.network_address), int(net.broadcast_address)
+        if start > cur:
+            out.append((cur, start - 1))
+        cur = max(cur, end + 1)
+    if cur <= 2**32 - 1:
+        out.append((cur, 2**32 - 1))
+    return out
+
+
+def cidrs(start, end):
+    return list(ipaddress.summarize_address_range(ipaddress.IPv4Address(start), ipaddress.IPv4Address(end)))
+
+
+def split_nets(srv):
+    """Сети режима «обход»: ВСЁ, кроме российских и локальных сетей (как раздельный туннель у MOST).
+
+    Российские сайты, банки, Госуслуги идут напрямую с устройства, всё зарубежное — через VPN.
+    Чтобы список уложился в SPLIT_LIMIT сетей, самые мелкие зарубежные промежутки между
+    российскими сетями отдаются «напрямую» (доли процента адресов). Список заблокированных
+    сервисов (blocked-nets.txt, extra-nets.txt) и TikTok идут через VPN всегда.
+    """
+    limit = int(option("SPLIT_LIMIT", SPLIT_LIMIT))
     me = ipaddress.ip_network(f"{srv['ip']}/32")
+    forced = [n for n in (read_nets(NETS_BASE) + read_nets(NETS_EXTRA)
+                          + [t[0] for t in read_tiktok()]) if n.version == 4]
+    ru = ru_nets()
+    tunnel = []
+    if ru:
+        local = [ipaddress.ip_network(n) for n in LOCAL_NETS]
+        gs = [(a, b, len(cidrs(a, b))) for a, b in gaps(ru + local + [me])]
+        sizes = sorted({b - a + 1 for a, b, _ in gs})
+        lo, hi = 0, len(sizes) - 1   # наименьший размер промежутка, при котором влезаем в limit
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if sum(n for a, b, n in gs if b - a + 1 >= sizes[mid]) <= limit:
+                hi = mid
+            else:
+                lo = mid + 1
+        tunnel = [net for a, b, _ in gs if b - a + 1 >= sizes[lo] for net in cidrs(a, b)]
+    v4 = ipaddress.collapse_addresses(tunnel + forced)
+    # Адрес самого сервера в туннель заворачивать нельзя — туннель замкнётся на себя.
     v4 = list(ipaddress.collapse_addresses(
         sub for n in v4 for sub in (n.address_exclude(me) if n.supernet_of(me) else [n])))
-    if len(v4) + len(v6) > limit:
-        if "bad" not in _BAD:
-            _BAD["bad"] = forbidden(srv)
-        v4 = compress(v4, limit - len(v6), _BAD["bad"])
-        if v4 is None:
-            return None
-    return v4 + v6
-
-
-def forbidden(srv):
-    """Что нельзя накрыть при объединении сетей: российские сети, локальные, сам сервер."""
-    ru = read_nets(RU_FILE)
-    if not ru:
-        try:
-            ru = fetch_ru()
-        except Exception as e:
-            die(f"сетей больше {MAX_NETS}, а для их объединения нужен список российских сетей, "
-                f"и он не скачался ({e}). Проверьте интернет на сервере и повторите")
-    extra = [ipaddress.ip_network(n) for n in LOCAL_NETS] + [ipaddress.ip_network(f"{srv['ip']}/32")]
-    iv = sorted((int(n.network_address), int(n.broadcast_address)) for n in ru + extra if n.version == 4)
-    merged = []
-    for lo, hi in iv:
-        if merged and lo <= merged[-1][1] + 1:
-            merged[-1][1] = max(merged[-1][1], hi)
-        else:
-            merged.append([lo, hi])
-    return merged
-
-
-def compress(v4, limit, bad):
-    """None, если уложиться нельзя. Объединяет соседние сети в общие надсети, пока их не станет limit.
-
-    Каждый раз берётся пара, объединение которой захватывает меньше всего лишних адресов, и только
-    если надсеть не задевает ни одной российской/локальной сети — так через VPN пойдут лишь лишние
-    зарубежные адреса (не страшно), а банки и Госуслуги по-прежнему напрямую.
-    """
-    starts = [lo for lo, _ in bad]
-
-    def clean(net):
-        lo, hi = int(net.network_address), int(net.broadcast_address)
-        i = bisect.bisect_right(starts, hi) - 1
-        return i < 0 or bad[i][1] < lo
-
-    v4 = sorted(v4)
-    while len(v4) > limit:
-        best = None
-        for i in range(len(v4) - 1):
-            x, y = v4[i], v4[i + 1]
-            lo, hi = int(x.network_address), int(y.broadcast_address)
-            plen = min(x.prefixlen, y.prefixlen, 32 - (lo ^ hi).bit_length())
-            if plen < 8:
-                continue
-            sup = ipaddress.ip_network((lo, plen), strict=False)
-            waste = sup.num_addresses - x.num_addresses - y.num_addresses
-            if (best is None or waste < best[0]) and clean(sup):
-                best = (waste, sup)
-        if best is None:
-            return None
-        sup = best[1]
-        v4 = sorted(ipaddress.collapse_addresses([n for n in v4 if not n.subnet_of(sup)] + [sup]))
-    return v4
+    # IPv6 — весь в туннель: у сервера IPv6 нет, приложения сразу переходят на IPv4 (так у MOST).
+    return v4 + [ipaddress.ip_network("::/0")]
 
 
 def split_allowed(srv):
-    nets = split_nets(srv)
-    if len(nets) > MAX_NETS:
-        die(f"в режиме «обход» {len(nets)} сетей, а можно не больше {MAX_NETS} "
-            f"(приложения Amnezia с большим списком работают плохо). Сократите {NETS_EXTRA}")
-    return ", ".join(map(str, nets))
+    return ", ".join(map(str, split_nets(srv)))
 
 
 # ---------- конфиги ----------
@@ -349,10 +328,12 @@ def client_conf(c, srv, variant, allowed_split=None):
         o["Jc"], o["Jmin"], o["Jmax"] = v["junk"]
     port = [srv["port"], *srv["backup"]][variant - 1]
     allowed = FULL if c["mode"] == "full" else (allowed_split or split_allowed(srv))
+    if ads_on(c) and c["mode"] != "full":
+        allowed = f"{ADBLOCK_DNS}/32, {allowed}"  # 10.x — локальная сеть, в «обходе» её нет: добавляем DNS
     lines = ["[Interface]",
              f"PrivateKey = {c['priv']}",
              f"Address = {c['ip']}/32",
-             f"DNS = {DNS}",
+             f"DNS = {ADBLOCK_DNS if ads_on(c) else DNS}",
              f"MTU = {MTU}",
              *(f"{k} = {o[k]}" for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"))]
     if v["i1"]:
@@ -363,6 +344,11 @@ def client_conf(c, srv, variant, allowed_split=None):
               f"AllowedIPs = {allowed}",
               "PersistentKeepalive = 25"]
     return "\n".join(lines) + "\n"
+
+
+def ads_on(c):
+    """Блокируется ли реклама у устройства: adblock.sh включён и у устройства её не выключали."""
+    return os.path.exists(ADBLOCK_FLAG) and c.get("ads", True)
 
 
 def conf_path(name, variant):
@@ -378,8 +364,11 @@ def write_client_files(c, srv, allowed_split=None):
         fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(client_conf(c, srv, v, allowed_split))
-        if have_qr:
-            subprocess.run(["qrencode", "-o", p[:-5] + ".png", "-s", "6", "-r", p], check=False)
+        png = p[:-5] + ".png"
+        if have_qr and os.path.getsize(p) <= QR_MAX:
+            subprocess.run(["qrencode", "-o", png, "-s", "6", "-r", p], check=False)
+        elif os.path.exists(png):
+            os.remove(png)  # конфиг слишком длинный для QR — старую картинку убираем
 
 
 def regen_all(srv):
@@ -542,7 +531,7 @@ def cmd_tiktok(a):
     cov = sum(1 for ip in ips if any(ip in n for n in final))
     print(f"TikTok в режиме «обход»: через VPN {cov} из {len(ips)} его адресов"
           f"{' — все' if cov == len(ips) else ' (остальные — российские кэши или не влезли в лимит)'}.")
-    print(f"Всего в режиме «обход» {len(split_nets(srv))} сетей. Конфиги «обхода» пересобраны — импортируйте заново.")
+    print(f"Конфиги «обхода» пересобраны ({len(split_nets(srv))} сетей) — импортируйте заново.")
     push_bot("Обновился список сетей (TikTok)")
 
 
@@ -628,14 +617,17 @@ def cmd_add(a):
 
 
 def mode_title(m):
-    return "режим «обход»: через VPN только заблокированное" if m == "split" else "режим «весь трафик»"
+    return "режим «обход»: через VPN всё, кроме российских сайтов" if m == "split" else "режим «весь трафик»"
 
 
 def print_files(c):
     print(f"Файлы (скачайте через SFTP в Termius): {OUT}/{c['name']}/")
     for v, info in VARIANTS.items():
         print(f"  {c['name']}-{v}.conf  — {info['title']}")
-    print(f"QR-код в терминале: vpn qr {c['name']}   (резервные: vpn qr {c['name']} 2 / 3)")
+    if c["mode"] == "full":
+        print(f"QR-код в терминале: vpn qr {c['name']}   (резервные: vpn qr {c['name']} 2 / 3)")
+    else:
+        print("Конфиг «обхода» длинный (сотни сетей) — QR-кода нет, переносите файл.")
 
 
 def cmd_qr(a):
@@ -645,9 +637,9 @@ def cmd_qr(a):
         die("нет qrencode: apt install qrencode")
     text = client_conf(c, srv, a.variant)
     print(f"{c['name']}-{a.variant}: {VARIANTS[a.variant]['title']}, {mode_title(c['mode'])}")
-    if c["mode"] == "split":
-        print("Конфиг длинный (список сетей) — если QR не влезает в экран, уменьшите шрифт в Termius\n"
-              f"или скачайте {conf_path(c['name'], a.variant)[:-5]}.png / .conf через SFTP.")
+    if len(text.encode()) > QR_MAX:
+        die(f"конфиг «обхода» слишком длинный для QR-кода ({len(text.encode())} байт). Перенесите файл "
+            f"{conf_path(c['name'], a.variant)} через SFTP в Termius или через бота")
     subprocess.run(["qrencode", "-t", "ansiutf8", "-m", "2"], input=text, text=True)
 
 
@@ -711,11 +703,12 @@ def cmd_list(a):
         print("Устройств нет. Добавить: vpn add iphone")
         return
     dump = peers_dump()
-    print(f"{'Имя':<13}{'Режим':<8}{'Адрес':<12}{'Подключение':<16}{'Трафик ↓/↑'}")
+    print(f"{'Имя':<13}{'Режим':<8}{'Рекл':<6}{'Адрес':<12}{'Подключение':<16}{'Трафик ↓/↑'}")
     for c in cs.values():
         d = dump.get(c["pub"], {})
         traffic = f"{human(d.get('tx', 0))} / {human(d.get('rx', 0))}" if d else "—"
-        print(f"{c['name']:<13}{('обход' if c['mode'] == 'split' else 'весь'):<8}{c['ip']:<12}"
+        ads = ("🛡" if ads_on(c) else "—") if os.path.exists(ADBLOCK_FLAG) else ""
+        print(f"{c['name']:<13}{('обход' if c['mode'] == 'split' else 'весь'):<8}{ads:<6}{c['ip']:<12}"
               f"{ago(d.get('hs', 0)):<16}{traffic}")
 
 
@@ -743,12 +736,68 @@ def cmd_status(a):
     print(f"{ok(fwd)} пересылка пакетов")
     print(f"{ok(rules)} правила iptables (NAT, резервные порты, MSS)")
     print(f"{ok(timer)} сторож (vpn-watchdog, раз в минуту)")
+    if os.path.exists(ADBLOCK_FLAG):
+        dns_ok = subprocess.run(["systemctl", "is-active", "--quiet", "dnsmasq"]).returncode == 0
+        print(f"{ok(dns_ok)} блокировка рекламы (dnsmasq на {ADBLOCK_DNS})")
     print(f"Сервер: {srv['ip']}, MTU {MTU}, устройств: {len(clients())}, подключено сейчас: {online}")
+    r = resources(srv["wan"])
+    print(f"Процессор {r['cpu']}% · память {r['mem']}% · диск {r['disk']}% · нагрузка {r['load']}")
+    print(f"Канал сейчас: ↓{r['down']:.0f} ↑{r['up']:.0f} Мбит/с · с запуска сервера {r['total_gb']:.0f} ГБ")
     cnt = port_counters()
     print("Порты UDP (сколько пакетов пришло с момента запуска):")
     for i, p in enumerate([srv["port"], *srv["backup"]], 1):
         print(f"  {p:<6} конфиги *-{i}.conf  — {cnt.get(p, 0)} пакетов")
     print("Журнал сторожа: tail /var/log/vpn-watchdog.log")
+
+
+def resources(wan):
+    """Процессор, память, диск и канал (как экран «🖥 Серверы» в MOST)."""
+    def cpu_times():
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        return sum(v), v[3] + v[4]
+
+    def net(iface):
+        try:
+            with open("/proc/net/dev") as f:
+                for line in f:
+                    if line.strip().startswith(iface + ":"):
+                        v = line.split(":", 1)[1].split()
+                        return int(v[0]), int(v[8])
+        except OSError:
+            pass
+        return 0, 0
+
+    t1, i1 = cpu_times()
+    n1 = net(wan)
+    time.sleep(1)
+    t2, i2 = cpu_times()
+    n2 = net(wan)
+    mem = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":")
+            mem[k] = int(v.split()[0])
+    du = shutil.disk_usage("/")
+    with open("/proc/loadavg") as f:
+        load = f.read().split()[0]
+    return {"cpu": round(100 * (1 - (i2 - i1) / max(1, t2 - t1))),
+            "mem": round(100 * (1 - mem["MemAvailable"] / mem["MemTotal"])),
+            "disk": round(100 * du.used / du.total), "load": load,
+            "down": (n2[0] - n1[0]) * 8 / 1e6, "up": (n2[1] - n1[1]) * 8 / 1e6,
+            "total_gb": (n2[0] + n2[1]) / 1e9}
+
+
+def cmd_ads(a):
+    srv = server()
+    c = get_client(a.name)
+    if not os.path.exists(ADBLOCK_FLAG):
+        die("блокировка рекламы не включена на сервере: bash adblock.sh")
+    c["ads"] = a.state == "on"
+    save(f"{CLIENTS}/{c['name']}.json", c)
+    write_client_files(c, srv)
+    print(f"«{c['name']}»: блокировка рекламы {'включена' if c['ads'] else 'выключена'}. Импортируйте конфиг заново:")
+    print_files(c)
 
 
 def cmd_rotate(a):
@@ -794,23 +843,37 @@ def cmd_set_ports(a):
 def cmd_regen(a):
     srv = server()
     regen_all(srv)
-    print(f"Конфиги пересобраны в {OUT} ({len(split_nets(srv))} сетей в режиме «обход»). Импортируйте заново.")
-    push_bot("Обновился список сетей")
+    print(f"Конфиги пересобраны в {OUT}. Импортируйте заново.")
+    push_bot(os.environ.get("VPN_PUSH_REASON", "Обновился список сетей"))
 
 
 def cmd_nets(a):
     srv = server()
     nets = split_nets(srv)
+    v4 = [n for n in nets if n.version == 4]
+    ru = ru_nets()
+    local = sum(ipaddress.ip_network(n).num_addresses for n in LOCAL_NETS)
+    foreign = 2**32 - sum(n.num_addresses for n in ipaddress.collapse_addresses(ru)) - local
+    via = sum(n.num_addresses for n in v4)
+    print(f"Режим «обход»: через VPN всё, кроме российских сетей ({len(ru)} шт., напрямую).")
+    print(f"В конфиге {len(nets)} сетей (лимит {option('SPLIT_LIMIT', SPLIT_LIMIT)}); "
+          f"зарубежных адресов через VPN ≈ {min(100, 100 * via / max(1, foreign)):.1f}%.")
     tk = read_tiktok()
-    print(f"В режиме «обход» через VPN идут {len(nets)} сетей (лимит {MAX_NETS}).")
     if tk:
-        print(f"TikTok: {sum(1 for t in tk if t[1] == 'asn')} сетей ByteDance + {sum(1 for t in tk if t[1] == 'dns')} "
-              f"по DNS ({TIKTOK_FILE}); соседние сети объединены без российских адресов.")
-        print("Обновляется само каждый час (vpn-tiktok.timer), журнал: /var/log/vpn-tiktok.log")
-    print(f"Основной список: {NETS_BASE} (обновляется при git pull + install.sh)")
-    print(f"Свои сети: {NETS_EXTRA} (по одной на строку), потом: vpn regen")
+        print(f"TikTok всегда через VPN: {len(tk)} сетей ({TIKTOK_FILE}), обновление раз в час.")
+    print(f"Всегда через VPN: {NETS_BASE} и свои сети {NETS_EXTRA}, потом: vpn regen")
     if a.verbose:
         print("\n".join(map(str, nets)))
+    if a.check:
+        for host in a.check:
+            try:
+                ip = ipaddress.ip_address(socket.gethostbyname(host))
+            except OSError:
+                print(f"  {host}: не резолвится")
+                continue
+            in_ru = any(ip in n for n in ru)
+            route = "VPN" if any(ip in n for n in v4) else "напрямую"
+            print(f"  {host:24} {str(ip):16} {'РФ ' if in_ru else 'зар'} -> {route}")
 
 
 def cmd_apply(a):
@@ -834,6 +897,8 @@ def main():
     s = sub.add_parser("mode"); s.add_argument("name"); s.add_argument("mode", choices=["split", "full"])
     s.set_defaults(fn=cmd_mode)
     s = sub.add_parser("del"); s.add_argument("name"); s.set_defaults(fn=cmd_del)
+    s = sub.add_parser("ads"); s.add_argument("name"); s.add_argument("state", choices=["on", "off"])
+    s.set_defaults(fn=cmd_ads)
     sub.add_parser("list").set_defaults(fn=cmd_list)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     s = sub.add_parser("rotate"); g = s.add_mutually_exclusive_group()
@@ -844,7 +909,9 @@ def main():
     sub.add_parser("regen").set_defaults(fn=cmd_regen)
     s = sub.add_parser("tiktok"); s.add_argument("--check", action="store_true", help="обновить, только если TikTok переехал")
     s.set_defaults(fn=cmd_tiktok)
-    s = sub.add_parser("nets"); s.add_argument("-v", "--verbose", action="store_true"); s.set_defaults(fn=cmd_nets)
+    s = sub.add_parser("nets"); s.add_argument("-v", "--verbose", action="store_true")
+    s.add_argument("check", nargs="*", help="сайты: как они пойдут (напр. vpn nets youtube.com sberbank.ru)")
+    s.set_defaults(fn=cmd_nets)
     s = sub.add_parser("apply"); s.add_argument("--restart", action="store_true"); s.set_defaults(fn=cmd_apply)
     a = p.parse_args()
     if not a.cmd:

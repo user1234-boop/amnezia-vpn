@@ -99,4 +99,38 @@ if (( 10#$(date +%M) % 10 == 0 )); then
     log "у сервера нет интернета (1.1.1.1 и 8.8.8.8 не отвечают) — проверьте хостинг"
   fi
 fi
+
+# 7. Блокировка рекламы: если dnsmasq упал, у устройств с ней не открываются сайты — поднимаем.
+if [[ -f /etc/vpn/adblock-on ]] && ! systemctl is-active --quiet dnsmasq; then
+  log "DNS с блокировкой рекламы (dnsmasq) не работает — перезапускаю"
+  systemctl restart dnsmasq 2>>"$LOG"
+  systemctl is-active --quiet dnsmasq && log "dnsmasq снова работает"
+fi
+
+# 8. Ресурсы сервера (как мониторинг в MOST): о проблеме, которая держится 2 проверки подряд, —
+#    🔴 в бота; когда прошла — 🟢.
+alert() {  # имя, 1/0 (плохо?), текст проблемы, текст «прошло»
+  local f="/run/vpn-watchdog.alert.$1" n
+  if [[ $2 == 1 ]]; then
+    n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$f"
+    if (( n == 2 )); then
+      echo "$(date '+%F %T') 🔴 $3" >>"$LOG"
+      [[ -x /usr/local/bin/vpn-bot && -f /etc/vpn/bot.env ]] && (timeout 30 /usr/local/bin/vpn-bot notify "🔴 $3" >/dev/null 2>&1 &)
+    fi
+  elif [[ -f "$f" ]]; then
+    if (( $(cat "$f") >= 2 )); then
+      echo "$(date '+%F %T') 🟢 $4" >>"$LOG"
+      [[ -x /usr/local/bin/vpn-bot && -f /etc/vpn/bot.env ]] && (timeout 30 /usr/local/bin/vpn-bot notify "🟢 $4" >/dev/null 2>&1 &)
+    fi
+    rm -f "$f"
+  fi
+}
+read -r _ u1 n1 s1 i1 w1 q1 sq1 _ </proc/stat; sleep 1; read -r _ u2 n2 s2 i2 w2 q2 sq2 _ </proc/stat
+busy=$(( (u2 + n2 + s2 + q2 + sq2) - (u1 + n1 + s1 + q1 + sq1) )); idle=$(( (i2 + w2) - (i1 + w1) ))
+CPU=$(( 100 * busy / (busy + idle > 0 ? busy + idle : 1) ))
+MEM=$(awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END {printf "%d", 100 * (1 - a / t)}' /proc/meminfo)
+DISK=$(df -P / | awk 'NR==2 {gsub("%", "", $5); print $5}')
+alert cpu  $(( CPU >= 90 ))  "процессор сервера загружен на ${CPU}% — VPN может тормозить" "процессор снова в норме (${CPU}%)"
+alert mem  $(( MEM >= 90 ))  "память сервера занята на ${MEM}%" "память снова в норме (${MEM}%)"
+alert disk $(( DISK >= 90 )) "диск сервера заполнен на ${DISK}% — почистите место (журналы: journalctl --vacuum-size=100M)" "место на диске есть (${DISK}%)"
 exit 0

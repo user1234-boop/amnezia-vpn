@@ -26,6 +26,7 @@ USERS_FILE = "/etc/vpn/bot-users.json"
 CLIENTS = "/etc/vpn/clients"
 OUT = "/root/vpn-configs"
 VPN = "/usr/local/bin/vpn"
+ADBLOCK_FLAG = "/etc/vpn/adblock-on"
 NAME_RE = re.compile(r"[A-Za-z0-9_]{1,12}")
 VARIANT_TITLES = {1: "основной", 2: "резерв: другой порт", 3: "резерв: маскировка под DNS"}
 REQUEST_COOLDOWN = 3600  # после отказа повторная заявка не раньше чем через час
@@ -58,7 +59,7 @@ HOWTO = (
     "в AmneziaWG — «Импорт из файла». Добавь все три.\n"
     "4. Включи туннель <b>-1</b>. Если не подключается — выключи его и включи <b>-2</b>, потом <b>-3</b>. "
     "Включай только один за раз.\n\n"
-    "QR-код (кнопки под конфигами) удобен, если бот открыт на компьютере, а сканируешь телефоном: "
+    "QR-код (если под конфигами есть кнопки QR) удобен, когда бот открыт на компьютере, а сканируешь телефоном: "
     "AmneziaWG → + → Сканировать QR-код.\n\n"
     "Торренты через этот VPN не работают."
 )
@@ -223,7 +224,7 @@ def devices():
 
 
 def mode_name(m):
-    return "🔀 обход (только заблокированное)" if m == "split" else "🌍 весь трафик"
+    return "🔀 обход (всё, кроме российских сайтов)" if m == "split" else "🌍 весь трафик"
 
 
 def new_device_name(u):
@@ -247,14 +248,26 @@ def send_configs(chat_id, name):
         path = f"{OUT}/{name}/{name}-{v}.conf"
         if os.path.exists(path):
             upload("sendDocument", chat_id, "document", path, caption=f"<b>{name}-{v}</b> — {title}")
-    send(chat_id, f"QR-коды <b>{name}</b> (если ставишь на другое устройство):",
-         inline=[[btn(f"🔳 QR {v}", f"qr:{name}:{v}") for v in VARIANT_TITLES]])
+    qrs = qr_buttons(name)
+    if qrs:
+        send(chat_id, f"QR-коды <b>{name}</b> (если ставишь на другое устройство):", inline=[qrs])
+
+
+def qr_buttons(name):
+    """Кнопки QR только для вариантов, где QR есть: конфиг «обхода» (сотни сетей) в QR не влезает."""
+    return [btn(f"🔳 QR {v}", f"qr:{name}:{v}") for v in VARIANT_TITLES
+            if os.path.exists(f"{OUT}/{name}/{name}-{v}.png")]
+
+
+def ads_enabled():
+    return os.path.exists(ADBLOCK_FLAG)
 
 
 def send_qr(chat_id, name, v):
     path = f"{OUT}/{name}/{name}-{v}.png"
     if not os.path.exists(path):
-        send(chat_id, "QR-кода нет. Пришлю файлы.")
+        send(chat_id, "Для этого конфига QR-кода нет (он слишком длинный). Пришлю файлы — "
+                      "на телефоне нажми на файл → «Поделиться» → AmneziaWG.")
         return send_configs(chat_id, name)
     upload("sendDocument", chat_id, "document", path, filename=f"{name}-{v}-qr.png",
            caption=f"QR <b>{name}-{v}</b> ({VARIANT_TITLES[v]}). AmneziaWG → + → Сканировать QR-код.")
@@ -274,8 +287,11 @@ def device_card(chat_id, name):
          f"📱 <b>{name}</b>\nЧьё: {who(owner) if owner else 'твоё'}\nРежим: {mode_name(d['mode'])}\n"
          f"Адрес: {d['ip']}\n" + (pre(line) if line else ""),
          inline=[[btn("📄 Файлы конфигов", f"files:{name}")],
-                 [btn("🔳 QR 1", f"qr:{name}:1"), btn("🔳 QR 2", f"qr:{name}:2"), btn("🔳 QR 3", f"qr:{name}:3")],
+                 *([qr_buttons(name)] if qr_buttons(name) else []),
                  [btn(f"Режим → {'весь трафик' if other == 'full' else 'обход'}", f"mode:{name}:{other}")],
+                 *([[btn("🛡 Реклама: блокируется → выключить" if d.get("ads", True) else
+                         "🛡 Реклама: не блокируется → включить",
+                         f"ads:{name}:{'off' if d.get('ads', True) else 'on'}")]] if ads_enabled() else []),
                  [btn("🗑 Удалить", f"delask:{name}"), btn("⬅️ Назад", "list")]])
 
 
@@ -297,7 +313,7 @@ def request_card(chat_id, u):
     n = len(u.get("devices", []))
     send(chat_id,
          f"🙋 <b>Заявка на VPN</b>\n{who(u)}\n" + (f"Уже есть конфигов: {n}\n" if n else "") +
-         "\nКакой режим выдать?\n🔀 <b>Обход</b> — через VPN только заблокированное (для телефона)\n"
+         "\nКакой режим выдать?\n🔀 <b>Обход</b> — через VPN всё, кроме российских сайтов (для телефона, AmneziaWG)\n"
          "🌍 <b>Весь трафик</b> — для компьютера",
          inline=[[btn("✅ Обход", f"ok:{u['id']}:split"), btn("✅ Весь трафик", f"ok:{u['id']}:full")],
                  [btn("❌ Отказать", f"no:{u['id']}"), btn("🚫 Заблокировать", f"ban:{u['id']}")]])
@@ -365,7 +381,7 @@ def admin_message(msg):
             return send(chat_id, f"«{text}» уже есть. Другое имя:")
         STATE.pop(chat_id, None)
         return send(chat_id, f"Режим для <b>{text}</b>?",
-                    inline=[[btn("🔀 Обход: только заблокированное", f"add:{text}:split")],
+                    inline=[[btn("🔀 Обход: всё, кроме российских сайтов", f"add:{text}:split")],
                             [btn("🌍 Весь трафик", f"add:{text}:full")],
                             [btn("Отмена", "cancel")]])
     send(chat_id, "Выбери действие в меню 👇", kb=ADMIN_MENU)
@@ -390,6 +406,20 @@ def admin_callback(chat_id, kind, rest):
             return send(chat_id, pre(out))
         send(chat_id, f"✅ <b>{name}</b> добавлен ({mode_name(mode)}). Конфиги:")
         return send_configs(chat_id, name)
+    if kind == "ads":
+        name, _, state = rest.partition(":")
+        ok, out = vpn("ads", name, "on" if state == "on" else "off")
+        if not ok:
+            return send(chat_id, pre(out))
+        what = "блокируется" if state == "on" else "больше не блокируется"
+        send(chat_id, f"✅ <b>{name}</b>: реклама {what}. Старые туннели {name}-1/2/3 удали, импортируй новые:")
+        send_configs(chat_id, name)
+        owner = owner_of(name)
+        if owner:
+            send(owner["id"], f"🔄 Твой VPN <b>{name}</b>: реклама {what}.\n"
+                              "Удали старые туннели в AmneziaWG и добавь новые файлы:")
+            send_configs(owner["id"], name)
+        return
     if kind == "mode":
         name, _, mode = rest.partition(":")
         ok, out = vpn("mode", name, mode)
@@ -528,6 +558,11 @@ STATE = {}  # chat_id -> что ждём от админа
 def send_all(header):
     """Новые конфиги: админам — все устройства, каждому человеку — его."""
     ds = devices()
+    only = os.environ.get("VPN_ONLY", "").split()
+    if only:  # только изменившиеся устройства
+        ds = {n: d for n, d in ds.items() if n in only}
+    if not ds:
+        return
     users = load_users()
     for a in ADMINS:
         send(a, f"🔄 {html.escape(header)}. Старые конфиги больше не работают — вот новые "

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Установка личного VPN на AmneziaWG (Ubuntu 22.04 / 24.04), без бота.
+# Установка личного VPN на AmneziaWG (Ubuntu 22.04 / 24.04). Telegram-бот — отдельно: bot.sh.
 #
 #   sudo bash install.sh                 — всё по умолчанию: случайный порт 1024–9999 (не 443), MTU 1280,
 #                                          устройства iphone (режим «обход») и pc (весь трафик)
@@ -12,6 +12,10 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Шаги ниже могут пересобирать конфиги; бот разошлёт их один раз в конце — только изменившиеся.
+export VPN_NO_PUSH=1
+conf_hashes() { for d in /root/vpn-configs/*/; do [[ -d $d ]] && echo "$(basename "$d") $(cat "$d"*.conf 2>/dev/null | sha256sum | cut -c1-16)"; done; }
+BEFORE="$(conf_hashes 2>/dev/null || true)"
 PORT=""
 IP=""
 DEVICES="iphone pc:full"
@@ -159,7 +163,7 @@ EOF
 systemctl daemon-reload
 systemctl enable --now vpn-watchdog.timer >/dev/null 2>&1
 
-step "TikTok целиком через VPN в режиме «обход» (проверка раз в час)"
+step "TikTok всегда через VPN в режиме «обход» (проверка раз в час)"
 cat >/etc/systemd/system/vpn-tiktok.service <<'UNIT'
 [Unit]
 Description=VPN: обновить сети TikTok, если он переехал
@@ -191,6 +195,13 @@ if [[ ! -f /etc/vpn/tiktok-nets.txt ]]; then
   vpn tiktok 2>&1 | sed 's/^/    /' || echo "    не получилось — повторится само в течение часа"
 fi
 
+if [[ ! -f /etc/vpn/adblock-on && ! -f /etc/vpn/adblock-disabled ]]; then
+  step "Блокировка рекламы (выключить: bash adblock.sh off)"
+  bash "$SCRIPT_DIR/adblock.sh" 2>&1 | sed 's/^/    /' || echo "    не получилось — попробуйте позже: bash adblock.sh"
+elif [[ -f /etc/vpn/adblock-on ]]; then
+  bash "$SCRIPT_DIR/adblock.sh" >/dev/null 2>&1 || true   # обновить скрипт и список
+fi
+
 step "Защита SSH от подбора пароля (fail2ban)"
 if "${APT[@]}" install -y -qq fail2ban >/dev/null 2>&1; then
   cat >/etc/fail2ban/jail.d/sshd-vpn.local <<'EOF'
@@ -215,6 +226,14 @@ else
   vpn regen >/dev/null
 fi
 
+# Бот: разослать конфиги, которые изменились (тем, чьи они), — один раз.
+AFTER="$(conf_hashes)"
+CHANGED="$(comm -13 <(sort <<<"$BEFORE") <(sort <<<"$AFTER") | awk '{print $1}' | paste -sd' ')"
+if [[ -n "$CHANGED" && -n "$BEFORE" && -x /usr/local/bin/vpn-bot && -f /etc/vpn/bot.env ]]; then
+  VPN_ONLY="$CHANGED" /usr/local/bin/vpn-bot send-all "Обновились настройки VPN" >/dev/null 2>&1 &
+  echo "Изменились конфиги: $CHANGED — бот пришлёт их (тебе и владельцам)."
+fi
+
 cat <<EOF
 
 ================ Готово ================
@@ -231,7 +250,9 @@ EOF
 vpn list
 cat <<EOF
 
-QR-код для телефона:   vpn qr ИМЯ   (например: vpn qr $(ls /etc/vpn/clients | head -n1 | sed 's/\.json$//'))
+Конфиг «обхода» длинный (сотни сетей) — переносите файл через SFTP или бота; QR есть у «весь трафик».
+Как пойдёт сайт:       vpn nets youtube.com sberbank.ru
+Диагностика скорости:  bash diag.sh
 Состояние сервера:     vpn status
 Все команды:           vpn --help
 Telegram-бот (по желанию): bash bot.sh 'ТОКЕН' ВАШ_ID

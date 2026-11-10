@@ -59,6 +59,8 @@ up() {
 
   iptables -N VPN_IN
   iptables -A VPN_IN -p udp --dport "$PORT" -j ACCEPT  # резервные после REDIRECT приходят уже на $PORT
+  iptables -A VPN_IN -i "$IFACE" -p udp --dport 53 -j ACCEPT  # DNS с блокировкой рекламы (adblock.sh)
+  iptables -A VPN_IN -i "$IFACE" -p tcp --dport 53 -j ACCEPT
   iptables -I INPUT 1 -j VPN_IN
 
   iptables -N VPN_FWD
