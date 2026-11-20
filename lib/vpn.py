@@ -9,6 +9,7 @@
   vpn del ИМЯ             удалить устройство
   vpn ads ИМЯ on|off      блокировка рекламы у устройства (включается на сервере: bash adblock.sh)
   vpn warp ИМЯ on|off     весь трафик устройства через Cloudflare WARP (включается: bash warp.sh)
+  vpn route add ДОМЕН vpn|warp   сайт всегда через VPN (IP сервера) или через WARP; vpn route del ДОМЕН; vpn route list
   vpn status              здоровье сервера: VPN, правила, порты, сторож
   vpn rotate [--ports|--obfs]  сменить порты и/или маскировку (конфиги придётся импортировать заново)
   vpn set-ports ОСН [Р1 Р2]    задать порты вручную
@@ -827,6 +828,78 @@ def cmd_warp(a):
         print(f"«{c['name']}»: через WARP только TikTok, остальное — с IP сервера.")
 
 
+ROUTE_FILES = {"warp": f"{ETC}/route-warp.txt", "vpn": f"{ETC}/route-vpn.txt"}
+ROUTE_TITLES = {"warp": "через Cloudflare WARP", "vpn": "через VPN (IP сервера, даже у устройств с ☁️)"}
+DOMAIN_RE = re.compile(r"(\*\.)?([a-z0-9-]+\.)+[a-z]{2,}")
+
+
+def route_entries(kind):
+    try:
+        with open(ROUTE_FILES[kind]) as f:
+            return [l.split("#")[0].strip() for l in f if l.split("#")[0].strip()]
+    except FileNotFoundError:
+        return []
+
+
+def route_target(t):
+    """Домен или IPv4-сеть; из ссылки вида https://claude.ai/new берём домен."""
+    t = t.strip().lower()
+    t = re.sub(r"^[a-z]+://", "", t)
+    if not re.fullmatch(r"[0-9.]+/[0-9]+", t):
+        t = t.split("/")[0].split(":")[0]
+    t = t.removeprefix("www.")
+    if DOMAIN_RE.fullmatch(t):
+        return t
+    try:
+        net = ipaddress.ip_network(t, strict=False)
+        if net.version == 4:
+            return str(net)
+    except ValueError:
+        pass
+    die(f"«{t}» — не домен и не IPv4-сеть (пример: claude.ai или 160.79.104.0/23)")
+
+
+def cmd_route(a):
+    if a.action == "list":
+        if not os.path.exists(f"{ETC}/warp-on"):
+            print("WARP выключен — без него все сайты и так идут через VPN (включить: bash warp.sh).")
+        for kind in ("vpn", "warp"):
+            items = route_entries(kind)
+            print(f"{ROUTE_TITLES[kind]}:")
+            print("  " + ("\n  ".join(items) if items else "—"))
+        print("TikTok — через WARP всегда (свои правила «через VPN» важнее).")
+        return
+    if not a.target:
+        die("укажите домен: vpn route add claude.ai vpn")
+    t = route_target(a.target)
+    changed = False
+    for kind, path in ROUTE_FILES.items():
+        items = route_entries(kind)
+        keep = [i for i in items if i != t]
+        add = a.action == "add" and kind == a.kind
+        if add and t not in items:
+            keep.append(t)
+        if keep != items or not os.path.exists(path):
+            header = []
+            try:
+                with open(path) as f:
+                    header = [l.rstrip("\n") for l in f if l.startswith("#")]
+            except FileNotFoundError:
+                pass
+            with open(path, "w") as f:
+                f.write("\n".join(header + keep) + "\n")
+            changed = True
+    if a.action == "add":
+        print(f"{t}: {ROUTE_TITLES[a.kind]}.")
+    else:
+        print(f"{t}: правило убрано — идёт как обычно.")
+    if changed and os.path.exists(f"{ETC}/warp-on"):
+        subprocess.run(["/usr/local/sbin/vpn-warp", "rules-up"], check=False)
+        print("Применено. На устройстве достаточно выключить и включить VPN.")
+    elif not os.path.exists(f"{ETC}/warp-on"):
+        print("WARP сейчас выключен — правило заработает, когда включите его (bash warp.sh).")
+
+
 def cmd_ads(a):
     srv = server()
     c = get_client(a.name)
@@ -940,6 +1013,9 @@ def main():
     s.set_defaults(fn=cmd_ads)
     s = sub.add_parser("warp"); s.add_argument("name"); s.add_argument("state", choices=["on", "off"])
     s.set_defaults(fn=cmd_warp)
+    s = sub.add_parser("route"); s.add_argument("action", choices=["add", "del", "list"])
+    s.add_argument("target", nargs="?"); s.add_argument("kind", nargs="?", choices=["vpn", "warp"], default="vpn")
+    s.set_defaults(fn=cmd_route)
     sub.add_parser("list").set_defaults(fn=cmd_list)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     s = sub.add_parser("rotate"); g = s.add_mutually_exclusive_group()

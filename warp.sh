@@ -13,8 +13,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DIR=/etc/vpn/warp
 CONF=/etc/wireguard/warp.conf
 FLAG=/etc/vpn/warp-on
-DOMAINS="tiktok.com tiktokv.com tiktokcdn.com tiktokcdn-us.com tiktokv.us tiktokv.eu tiktokw.us ttwstatic.com
-ibytedtos.com ibyteimg.com byteimg.com byteoversea.com bytedance.com byteeffecttos-g.com musical.ly ttlivecdn.com"
 
 die() { echo "Ошибка: $*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || die "запустите от root"
@@ -24,7 +22,9 @@ if [[ "${1:-}" == "status" ]]; then
   if [[ ! -f $FLAG ]]; then echo "WARP для TikTok выключен (включить: bash warp.sh)"; exit 0; fi
   ip link show warp >/dev/null 2>&1 && echo "✅ интерфейс warp поднят" || echo "❌ интерфейс warp не поднят"
   /usr/local/sbin/vpn-warp check && echo "✅ маршрут TikTok -> WARP на месте" || echo "❌ маршрута TikTok -> WARP нет (TikTok идёт с IP сервера)"
-  echo "адресов TikTok в списке: $(ipset list vpn_warp 2>/dev/null | grep -cE '^[0-9]')"
+  echo "адресов «через WARP» (TikTok и свои): $(ipset list vpn_warp 2>/dev/null | grep -cE '^[0-9]')"
+  echo "адресов «через VPN» (свои): $(ipset list vpn_nowarp 2>/dev/null | grep -cE '^[0-9]')"
+  echo "свои правила: vpn route list"
   echo "выход через WARP:"; /usr/local/sbin/vpn-warp test | sed 's/^/  /'
   exit 0
 fi
@@ -34,6 +34,7 @@ if [[ "${1:-}" == "off" ]]; then
   systemctl disable --now wg-quick@warp 2>/dev/null || true
   /usr/local/sbin/vpn-warp rules-down 2>/dev/null || true
   ipset destroy vpn_warp 2>/dev/null || true
+  ipset destroy vpn_nowarp 2>/dev/null || true
   rm -f /etc/dnsmasq.d/vpn-warp.conf
   systemctl is-active --quiet dnsmasq && systemctl restart dnsmasq
   echo "WARP для TikTok выключен: TikTok снова идёт с IP сервера."
@@ -95,12 +96,21 @@ PersistentKeepalive = 25
 EOF
 umask 022
 
-# DNS с блокировкой рекламы сам добавляет адреса доменов TikTok в список в момент запроса.
-if systemctl is-active --quiet dnsmasq; then
-  printf 'ipset=/%s/vpn_warp\n' "$(echo $DOMAINS | tr ' ' '/')" >/etc/dnsmasq.d/vpn-warp.conf
-fi
+# Policy routing: свои списки «через WARP» и «через VPN» (vpn route). Создаём только если их нет.
+[[ -f /etc/vpn/route-warp.txt ]] || cat >/etc/vpn/route-warp.txt <<'EOF'
+# Через Cloudflare WARP (IP Cloudflare, а не сервера): домен (с поддоменами) или IPv4-сеть, по одному на строку.
+# TikTok сюда писать не нужно — он через WARP и так. Править: vpn route add ДОМЕН warp
+EOF
+[[ -f /etc/vpn/route-vpn.txt ]] || cat >/etc/vpn/route-vpn.txt <<'EOF'
+# Всегда с IP сервера (Нидерланды), даже у устройств «☁️ Весь трафик через WARP».
+# Домен (с поддоменами) или IPv4-сеть, по одному на строку. Править: vpn route add ДОМЕН vpn
+claude.ai
+claude.com
+anthropic.com
+EOF
 
 ipset create vpn_warp hash:net timeout 172800 -exist
+ipset create vpn_nowarp hash:net timeout 172800 -exist
 systemctl enable wg-quick@warp >/dev/null 2>&1
 if ! systemctl restart wg-quick@warp; then
   journalctl -u wg-quick@warp -n 20 --no-pager
@@ -108,7 +118,7 @@ if ! systemctl restart wg-quick@warp; then
   die "туннель warp не поднялся — пришлите этот вывод. TikTok идёт как раньше."
 fi
 touch "$FLAG"   # только когда туннель поднялся: по этой отметке за ним следит сторож
-[[ -f /etc/dnsmasq.d/vpn-warp.conf ]] && systemctl restart dnsmasq
+/usr/local/sbin/vpn-warp refresh   # списки адресов и подсказки для DNS сервера
 
 sleep 3
 echo "==> Проверяю"
