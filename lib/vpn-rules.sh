@@ -31,7 +31,15 @@ unhook() {  # table chain from
   return 0
 }
 
+unhook6() {
+  while ip6tables -D FORWARD -j VPN6_FWD 2>/dev/null; do :; done
+  ip6tables -F VPN6_FWD 2>/dev/null
+  ip6tables -X VPN6_FWD 2>/dev/null
+  return 0
+}
+
 down() {
+  unhook6
   unhook nat VPN_PRE PREROUTING
   unhook nat VPN_POST POSTROUTING
   unhook filter VPN_IN INPUT
@@ -82,6 +90,19 @@ up() {
       -m tcpmss --mss "$((mss + 1)):65535" -j TCPMSS --set-mss "$mss"
   done
   iptables -t mangle -I FORWARD 1 -j VPN_MSS
+
+  # IPv6 из туннеля (у устройств внутренний fd08:8::/64) — в интернет не выпускаем, а сразу отклоняем:
+  # приложение мгновенно переходит на IPv4. Иначе IPv6 шёл бы мимо WARP и правил маршрутизации.
+  if [[ "${IPV6:-0}" == 1 ]]; then
+    # Чтобы пакеты попали в FORWARD (и получили отказ), нужна пересылка IPv6. accept_ra=2 — чтобы
+    # сервер не потерял свой IPv6 от хостинга, если он есть.
+    sysctl -qw "net.ipv6.conf.$WAN.accept_ra=2" 2>/dev/null || true
+    sysctl -qw net.ipv6.conf.all.forwarding=1 2>/dev/null || true
+    ip6tables -N VPN6_FWD
+    ip6tables -A VPN6_FWD -i "$IFACE" -p tcp -j REJECT --reject-with tcp-reset
+    ip6tables -A VPN6_FWD -i "$IFACE" -j REJECT --reject-with icmp6-adm-prohibited
+    ip6tables -I FORWARD 1 -j VPN6_FWD
+  fi
 }
 
 check() {
@@ -91,7 +112,8 @@ check() {
   iptables -C FORWARD -j VPN_FWD 2>/dev/null &&
   iptables -t mangle -C FORWARD -j VPN_MSS 2>/dev/null &&
   iptables -t mangle -C PREROUTING -j VPN_CNT 2>/dev/null &&
-  iptables -t nat -C VPN_POST -s "$SUBNET" -o "$WAN" -j MASQUERADE 2>/dev/null
+  iptables -t nat -C VPN_POST -s "$SUBNET" -o "$WAN" -j MASQUERADE 2>/dev/null &&
+  { [[ "${IPV6:-0}" != 1 ]] || ip6tables -C FORWARD -j VPN6_FWD 2>/dev/null; }
 }
 
 case "${1:-}" in

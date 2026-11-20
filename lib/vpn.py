@@ -41,6 +41,10 @@ OUT = "/root/vpn-configs"
 IFACE = "awg0"
 AWG_CONF = f"/etc/amnezia/amneziawg/{IFACE}.conf"
 SUBNET = ipaddress.ip_network("10.8.0.0/24")
+# Внутренний IPv6 в туннеле (ULA, в интернет не ходит). Без него устройство, у которого есть свой IPv6
+# (точка доступа, мобильный интернет), шлёт IPv6 в туннель без адреса — Chrome: ERR_ADDRESS_INVALID.
+# С ним система сама выбирает IPv4, а сервер мгновенно отклоняет IPv6 из туннеля (vpn-rules).
+SUBNET6 = ipaddress.ip_network("fd08:8::/64")
 MTU = 1280
 DNS = "1.1.1.1, 1.0.0.1"
 SPLIT_LIMIT = 1000   # сетей в режиме «обход»; своё значение: SPLIT_LIMIT=... в /etc/vpn/options
@@ -295,10 +299,24 @@ def split_allowed(srv):
 
 # ---------- конфиги ----------
 
+def ipv6_ok():
+    """Можно ли дать туннелю IPv6: IPv6 в ядре сервера не выключен и есть ip6tables."""
+    try:
+        with open("/proc/sys/net/ipv6/conf/all/disable_ipv6") as f:
+            return f.read().strip() == "0" and bool(shutil.which("ip6tables"))
+    except OSError:
+        return False
+
+
+def ip6(c):
+    """IPv6 устройства в туннеле: fd08:8::<последний октет IPv4>."""
+    return str(SUBNET6[int(c["ip"].rsplit(".", 1)[1])])
+
+
 def write_env(srv):
     wan = srv["wan"]
     text = (f"IFACE={IFACE}\nPORT={srv['port']}\nBACKUP_PORTS=\"{' '.join(map(str, srv['backup']))}\"\n"
-            f"WAN={wan}\nSUBNET={SUBNET}\nMTU={MTU}\n")
+            f"WAN={wan}\nSUBNET={SUBNET}\nMTU={MTU}\nIPV6={1 if ipv6_ok() else 0}\n")
     fd = os.open(ENV_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(text)
@@ -308,14 +326,15 @@ def write_server_conf(srv):
     o = srv["obfs"]
     lines = ["[Interface]",
              f"PrivateKey = {srv['priv']}",
-             f"Address = {SUBNET[1]}/{SUBNET.prefixlen}",
+             f"Address = {SUBNET[1]}/{SUBNET.prefixlen}" + (f", {SUBNET6[1]}/64" if ipv6_ok() else ""),
              f"ListenPort = {srv['port']}",
              f"MTU = {MTU}",
              *(f"{k} = {o[k]}" for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4")),
              "PostUp = /usr/local/sbin/vpn-rules up",
              "PostDown = /usr/local/sbin/vpn-rules down"]
     for c in clients().values():
-        lines += ["", f"# {c['name']}", "[Peer]", f"PublicKey = {c['pub']}", f"AllowedIPs = {c['ip']}/32"]
+        v6 = f", {ip6(c)}/128" if ipv6_ok() else ""
+        lines += ["", f"# {c['name']}", "[Peer]", f"PublicKey = {c['pub']}", f"AllowedIPs = {c['ip']}/32{v6}"]
     os.makedirs(os.path.dirname(AWG_CONF), exist_ok=True)
     fd = os.open(AWG_CONF + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -334,7 +353,7 @@ def client_conf(c, srv, variant, allowed_split=None):
         allowed = f"{ADBLOCK_DNS}/32, {allowed}"  # 10.x — локальная сеть, в «обходе» её нет: добавляем DNS
     lines = ["[Interface]",
              f"PrivateKey = {c['priv']}",
-             f"Address = {c['ip']}/32",
+             f"Address = {c['ip']}/32" + (f", {ip6(c)}/128" if ipv6_ok() else ""),
              f"DNS = {ADBLOCK_DNS if ads_on(c) else DNS}",
              f"MTU = {MTU}",
              *(f"{k} = {o[k]}" for k in ("Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"))]
