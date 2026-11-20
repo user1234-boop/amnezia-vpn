@@ -80,11 +80,16 @@ cat >"$UPDATE" <<'EOF'
 LIST=/var/lib/vpn/adblock.conf
 URL=https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
 # Не блокировать (домен и все поддомены): плеер YouTube ждёт рекламную вставку от серверов Google
-# и зависает, если её заблокировать. Свои исключения — по домену на строку в /etc/vpn/adblock-allow.txt.
+# и зависает, если её заблокировать. Свои исключения — по домену на строку в /etc/vpn/adblock-allow.txt;
+# сайты из vpn route (route-vpn.txt, route-warp.txt) не блокируются тоже.
 ALLOW="youtube.com youtu.be youtube-nocookie.com googlevideo.com ytimg.com ggpht.com googleapis.com gstatic.com
 google.com doubleclick.net googlesyndication.com googleadservices.com googletagservices.com"
 allow_re() {
-  { printf '%s\n' $ALLOW; [[ -f /etc/vpn/adblock-allow.txt ]] && grep -oE '^[a-z0-9._-]+' /etc/vpn/adblock-allow.txt; } \
+  # + сайты из своих правил маршрутизации (vpn route): раз их явно направили — блокировать их нельзя.
+  { printf '%s\n' $ALLOW
+    for f in /etc/vpn/adblock-allow.txt /etc/vpn/route-vpn.txt /etc/vpn/route-warp.txt; do
+      [[ -f $f ]] && sed -E 's/#.*//; s/^[[:space:]]*\*\.//' "$f" | grep -oE '^[a-z0-9._-]+\.[a-z]{2,}'
+    done; } \
     | sed 's/\./\\./g' | paste -sd'|' | sed 's/.*/(^|\\.)(&)$/'
 }
 tmp=$(mktemp); raw=$(mktemp)

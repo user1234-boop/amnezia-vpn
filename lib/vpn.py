@@ -893,6 +893,9 @@ def cmd_route(a):
         print(f"{t}: {ROUTE_TITLES[a.kind]}.")
     else:
         print(f"{t}: правило убрано — идёт как обычно.")
+    if changed and os.path.exists(ADBLOCK_FLAG) and os.path.exists("/usr/local/sbin/vpn-adblock-update"):
+        # Сайты из правил маршрутизации не должны попадать под блокировку рекламы.
+        subprocess.run(["/usr/local/sbin/vpn-adblock-update"], check=False)
     if changed and os.path.exists(f"{ETC}/warp-on"):
         subprocess.run(["/usr/local/sbin/vpn-warp", "rules-up"], check=False)
         print("Применено. На устройстве достаточно выключить и включить VPN.")
